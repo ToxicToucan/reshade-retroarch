@@ -25,6 +25,13 @@
 // The values stored in the frame are averaged as they are (not converted to linear
 // light first), as RetroArch passes a core's picture to a preset.
 //
+// HDR frames (rra_input 1: scRGB, linear BT.709 with 1.0 = 80 nits; rra_input 2: HDR10,
+// BT.2020 with the PQ curve) are first turned into the SDR values RetroArch presets are
+// written for: linear light divided by rra_paper_white nits (so paper white becomes SDR
+// white), converted to BT.709, limited to 0..1 (brighter highlights are clipped) and
+// encoded with a 2.2 power curve. The output pass (output.slang) undoes this after the
+// preset. rra_input 0 (SDR frames) leaves the values as they are.
+//
 // The values are set by the add-on through these parameters (they are not meant to
 // be changed by hand):
 
@@ -35,6 +42,8 @@
 #pragma parameter rra_native_w "Game picture: native width" 1.0 1.0 16384.0 1.0
 #pragma parameter rra_native_h "Game picture: native height" 1.0 1.0 16384.0 1.0
 #pragma parameter rra_average "Game picture: average each cell (1) or take its centre (0)" 0.0 0.0 1.0 1.0
+#pragma parameter rra_input "Frame: 0 SDR, 1 scRGB, 2 HDR10" 0.0 0.0 2.0 1.0
+#pragma parameter rra_paper_white "Frame: paper white of an HDR frame (nits)" 200.0 1.0 10000.0 1.0
 
 layout(push_constant) uniform Push
 {
@@ -46,6 +55,8 @@ layout(push_constant) uniform Push
     float rra_native_w;
     float rra_native_h;
     float rra_average;
+    float rra_input;
+    float rra_paper_white;
 } params;
 
 layout(std140, set = 0, binding = 0) uniform UBO
@@ -69,6 +80,36 @@ layout(location = 0) in vec2 vTexCoord;
 layout(location = 0) out vec4 FragColor;
 layout(set = 0, binding = 2) uniform sampler2D Source;
 
+// Linear BT.2020 to linear BT.709 (inverse of ITU-R BT.2087's matrix).
+vec3 bt2020_to_bt709(vec3 c)
+{
+    return vec3(dot(vec3(1.660491, -0.587641, -0.072850), c), dot(vec3(-0.124550, 1.132900, -0.008349), c),
+                dot(vec3(-0.018151, -0.100579, 1.118730), c));
+}
+
+// PQ (SMPTE ST 2084) decoding: linear light where 1.0 is 10000 nits.
+vec3 pq_decode(vec3 e)
+{
+    const float m1 = 0.1593017578125, m2 = 78.84375;
+    const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;
+    const vec3 p = pow(clamp(e, 0.0, 1.0), vec3(1.0 / m2));
+    return pow(max(p - c1, 0.0) / (c2 - c3 * p), vec3(1.0 / m1));
+}
+
+// The frame pixel at `p`, as SDR (see the top of the file).
+vec3 frame_pixel(ivec2 p)
+{
+    const vec3 v = texelFetch(Source, p, 0).rgb;
+    if (params.rra_input < 0.5)
+        return v;
+    vec3 c; // linear BT.709, 1.0 = paper white
+    if (params.rra_input < 1.5)
+        c = v * (80.0 / params.rra_paper_white);
+    else
+        c = bt2020_to_bt709(pq_decode(v) * (10000.0 / params.rra_paper_white));
+    return pow(clamp(c, 0.0, 1.0), vec3(1.0 / 2.2));
+}
+
 void main()
 {
     // Which native pixel this output pixel is.
@@ -80,7 +121,7 @@ void main()
     {
         // Exact integer maths: frame pixel at the centre of that cell.
         const uvec2 p = origin + ((2u * cell + 1u) * size) / (2u * native);
-        FragColor = vec4(texelFetch(Source, ivec2(p), 0).rgb, 1.0);
+        FragColor = vec4(frame_pixel(ivec2(p)), 1.0);
         return;
     }
     // Area average. The cell's edges in frame pixels: [lo, hi) on each axis.
@@ -97,7 +138,7 @@ void main()
         for (int x = first.x; x <= last.x; ++x)
         {
             const float wx = min(float(x + 1), hi.x) - max(float(x), lo.x);
-            row += wx * texelFetch(Source, ivec2(x, y), 0).rgb;
+            row += wx * frame_pixel(ivec2(x, y));
         }
         sum += wy * row;
     }

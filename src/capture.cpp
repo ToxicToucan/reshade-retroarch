@@ -1,4 +1,5 @@
-// Implementation of capture.h: writes the built-in capture shader and preset to disk.
+// Implementation of capture.h: writes the built-in capture and output shaders and presets
+// to disk, and sets their parameters.
 
 #include "capture.h"
 #include "capture_slang.h"
@@ -46,6 +47,32 @@ bool write_if_different(const fs::path &path, const std::string &text)
 }
 }
 
+// Writes the shader `slang` as `shader_name` and the preset `slangp` as `preset_name` into
+// a folder named `prefix` plus a hash of their content, under the user's temporary
+// folder, and returns the preset's path (UTF-8). The hash means an older version's files
+// are never reused. Returns an empty string and sets `error` (naming `what`) on failure.
+static std::string write_preset(const wchar_t *prefix, const wchar_t *shader_name, const std::string &slang,
+                                const wchar_t *preset_name, const std::string &slangp, const char *what,
+                                std::string &error)
+{
+    wchar_t tmp[MAX_PATH] = {};
+    if (GetTempPathW(MAX_PATH, tmp) == 0)
+    {
+        error = std::string("no temporary folder for the ") + what;
+        return {};
+    }
+    const size_t hash = std::hash<std::string>()(slang + slangp);
+    const fs::path dir = fs::path(tmp) / (prefix + std::to_wstring(hash));
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (!write_if_different(dir / shader_name, slang) || !write_if_different(dir / preset_name, slangp))
+    {
+        error = std::string("could not write the ") + what + " to " + utf8_from_path(dir);
+        return {};
+    }
+    return utf8_from_path(dir / preset_name);
+}
+
 std::string capture_preset_path(bool shader_model_3, std::string &error)
 {
     static std::mutex mutex;
@@ -59,26 +86,21 @@ std::string capture_preset_path(bool shader_model_3, std::string &error)
     std::string slangp = kCaptureSlangp;
     if (shader_model_3)
         slangp.replace(slangp.find("\"capture.slang\""), 15, "\"capture_sm3.slang\"");
-    wchar_t tmp[MAX_PATH] = {};
-    if (GetTempPathW(MAX_PATH, tmp) == 0)
-    {
-        error = "no temporary folder for the capture shader";
-        return {};
-    }
-    // The folder name includes a hash of the content: an older version's files are never
-    // reused.
-    const size_t hash = std::hash<std::string>()(slang + slangp);
-    const fs::path dir = fs::path(tmp) / (L"reshade-retroarch-capture-" + std::to_wstring(hash));
-    std::error_code ec;
-    fs::create_directories(dir, ec);
-    const wchar_t *const shader_name = shader_model_3 ? L"capture_sm3.slang" : L"capture.slang";
-    if (!write_if_different(dir / shader_name, slang) || !write_if_different(dir / L"capture.slangp", slangp))
-    {
-        error = "could not write the capture shader to " + utf8_from_path(dir);
-        return {};
-    }
-    cached[shader_model_3] = utf8_from_path(dir / L"capture.slangp");
+    cached[shader_model_3] =
+        write_preset(L"reshade-retroarch-capture-", shader_model_3 ? L"capture_sm3.slang" : L"capture.slang", slang,
+                     L"capture.slangp", slangp, "capture shader", error);
     return cached[shader_model_3];
+}
+
+std::string output_preset_path(std::string &error)
+{
+    static std::mutex mutex;
+    static std::string cached;
+    std::lock_guard<std::mutex> lock(mutex);
+    if (cached.empty())
+        cached = write_preset(L"reshade-retroarch-output-", L"output.slang", kOutputSlang, L"output.slangp",
+                              kOutputSlangp, "HDR output shader", error);
+    return cached;
 }
 
 bool set_capture_params(ShaderChain &capture, const PixelGrid &grid, std::string &error)
@@ -91,4 +113,18 @@ bool set_capture_params(ShaderChain &capture, const PixelGrid &grid, std::string
         if (!capture.set_param(name, float(value), error))
             return false;
     return true;
+}
+
+bool set_capture_colour(ShaderChain &capture, FrameColour colour, const HdrSettings &hdr, std::string &error)
+{
+    return capture.set_param("rra_input", float(int(colour)), error) &&
+           capture.set_param("rra_paper_white", hdr.paper_white, error);
+}
+
+bool set_output_params(ShaderChain &output, FrameColour colour, const HdrSettings &hdr, std::string &error)
+{
+    return output.set_param("rra_output", float(int(colour)), error) &&
+           output.set_param("rra_paper_white", hdr.paper_white, error) &&
+           output.set_param("rra_peak", hdr.peak, error) &&
+           output.set_param("rra_expand_gamut", hdr.expand_gamut ? 1.0f : 0.0f, error);
 }
