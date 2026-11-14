@@ -58,6 +58,7 @@ struct Settings
     int mode = native_auto;             // a NativeMode value
     int manual_w = 320, manual_h = 240; // original resolution used in "Fixed" mode
     DownsampleSettings downsample;      // size, shape and crop used in "Downsample" mode
+    HdrSettings hdr;                    // paper white, peak and gamut for games that output HDR
     std::vector<fs::path> extra_paths;  // extra folders to search for presets (ShaderPaths=)
 };
 
@@ -94,6 +95,7 @@ struct RuntimeData
     bool detect_pending = false;
     uint64_t frame = 0; // frames rendered; passed to the shaders, which may animate with it
     int frame_w = 0, frame_h = 0; // size of the last frame on_begin_effects saw, for the overlay
+    FrameColour colour = FrameColour::sdr; // how that frame was encoded, for the overlay
     // Times in seconds (now_seconds()): next on-disk check of the companion file, last time
     // on_begin_effects ran, and last time the runtime was initialised or reloaded its effects.
     double next_file_check = 0, last_effects = 0, created = 0;
@@ -144,7 +146,7 @@ std::mutex g_mutex;
 // The add-on's data for each ReShade effect runtime.
 std::unordered_map<effect_runtime *, std::unique_ptr<RuntimeData>> g_runtimes;
 // Every live swap chain, by native handle. The effect runtime does not report its colour
-// space, so hdr_output() looks up the runtime's swap chain here to read it.
+// space, so frame_colour() looks up the runtime's swap chain here to read it.
 std::unordered_map<uint64_t, swapchain *> g_swapchains;
 
 // Preset search state, used only by the overlay (and by AddonUninit): the running search
@@ -189,6 +191,13 @@ void clamp_downsample(DownsampleSettings &d)
         *c = std::isfinite(*c) ? std::clamp(*c, 0.0f, kDownsampleMaxCrop) : 0.0f;
 }
 
+// Keeps the HDR settings within kHdrMinNits..kHdrMaxNits (capture.h).
+void clamp_hdr(HdrSettings &h)
+{
+    for (float *v : {&h.paper_white, &h.peak})
+        *v = std::isfinite(*v) ? std::clamp(*v, kHdrMinNits, kHdrMaxNits) : kHdrMinNits;
+}
+
 // Reads the settings from the global ReShade.ini into g_settings. Only the first call does
 // anything. Out-of-range values are corrected: an unknown mode becomes automatic detection,
 // the "Fixed" and "Downsample" sizes are clamped to 16..7680 x 16..4320, and each crop to
@@ -217,6 +226,10 @@ void load_settings()
     g_settings.manual_w = std::clamp(g_settings.manual_w, 16, 7680);
     g_settings.manual_h = std::clamp(g_settings.manual_h, 16, 4320);
     clamp_downsample(d);
+    reshade::get_config_value(nullptr, kSection, "HdrPaperWhite", g_settings.hdr.paper_white);
+    reshade::get_config_value(nullptr, kSection, "HdrPeak", g_settings.hdr.peak);
+    reshade::get_config_value(nullptr, kSection, "HdrExpandGamut", g_settings.hdr.expand_gamut);
+    clamp_hdr(g_settings.hdr);
 
     // ShaderPaths: extra folders to search for presets. The first call gets the value's
     // size. ReShade splits values on ',' and returns the parts separated by '\0', so '\0',
@@ -259,6 +272,9 @@ void save_settings()
     reshade::set_config_value(nullptr, kSection, "DownsampleCropTop", d.crop_top);
     reshade::set_config_value(nullptr, kSection, "DownsampleCropRight", d.crop_right);
     reshade::set_config_value(nullptr, kSection, "DownsampleCropBottom", d.crop_bottom);
+    reshade::set_config_value(nullptr, kSection, "HdrPaperWhite", g_settings.hdr.paper_white);
+    reshade::set_config_value(nullptr, kSection, "HdrPeak", g_settings.hdr.peak);
+    reshade::set_config_value(nullptr, kSection, "HdrExpandGamut", g_settings.hdr.expand_gamut);
 }
 
 // Starts a background search for shader presets (see Scan), unless one is already running.
@@ -462,7 +478,7 @@ void on_reloaded_effects(effect_runtime *runtime)
 }
 
 // ReShade event: a swap chain was created or resized. Records it in g_swapchains under its
-// native handle, so hdr_output() can find it and read its colour space.
+// native handle, so frame_colour() can find it and read its colour space.
 void on_init_swapchain(swapchain *sc, bool)
 {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -485,16 +501,53 @@ void on_destroy_swapchain(swapchain *sc, bool resize)
         it = it->second->native == native ? g_runtimes.erase(it) : std::next(it);
 }
 
-// Returns true if the swap chain of `runtime` outputs HDR (colour space scRGB, HDR10 PQ or
-// HDR10 HLG), false if it outputs SDR or its swap chain is not recorded. The caller must hold
-// g_mutex.
-bool hdr_output(effect_runtime *runtime)
+// Sets `out` to how the frame of `runtime`, a back buffer of format `fmt`, is encoded:
+// scRGB for a 16-bit float back buffer (Windows always shows those as scRGB) or the scRGB
+// colour space, HDR10 for the HDR10 (PQ) colour space with a 10-bit back buffer, SDR
+// otherwise (also when the swap chain is not recorded). Returns false and sets `error` for
+// HDR it cannot handle: HLG, or a colour space that does not fit the format. The caller
+// must hold g_mutex.
+bool frame_colour(effect_runtime *runtime, format fmt, FrameColour &out, std::string &error)
 {
+    out = FrameColour::sdr;
     const auto it = g_swapchains.find(runtime->get_native());
-    if (it == g_swapchains.end())
+    const color_space cs = it == g_swapchains.end() ? color_space::unknown : it->second->get_color_space();
+    fmt = format_to_default_typed(fmt, 0);
+    if (fmt == format::r16g16b16a16_float)
+    {
+        out = FrameColour::scrgb;
+        return true;
+    }
+    if (cs == color_space::hdr10_pq && fmt == format::r10g10b10a2_unorm)
+    {
+        out = FrameColour::hdr10;
+        return true;
+    }
+    if (cs == color_space::hdr10_hlg)
+    {
+        error = "HDR output with the HLG curve is not supported. Use HDR10 or scRGB in the game, or turn its HDR off.";
         return false;
-    const color_space cs = it->second->get_color_space();
-    return cs == color_space::scrgb || cs == color_space::hdr10_pq || cs == color_space::hdr10_hlg;
+    }
+    if (cs == color_space::scrgb || cs == color_space::hdr10_pq)
+    {
+        error = "HDR output in back buffer format " + std::to_string(int(fmt)) + " is not supported.";
+        return false;
+    }
+    return true;
+}
+
+// The name of `c` for the status line and the overlay.
+const char *colour_name(FrameColour c)
+{
+    switch (c)
+    {
+    case FrameColour::scrgb:
+        return "HDR (scRGB)";
+    case FrameColour::hdr10:
+        return "HDR (HDR10)";
+    default:
+        return "SDR";
+    }
 }
 
 // ReShade event: a graphics device is being destroyed. Removes the data of every effect
@@ -609,8 +662,9 @@ bool prepare(RuntimeData &rd, device *dev, command_queue *queue)
 // drawn and is about to show; the shader's result is written back into it, and ReShade's own
 // effects then run on top. `cmd_list` is the command list to record the work on.
 // The frame is left untouched when the ReShade preset has no companion .slangp, the game's
-// graphics API is not supported, the output is HDR, the shader cannot be loaded, or (in
-// automatic mode) no pixel grid has been found yet. Sets rd's status or error to describe
+// graphics API is not supported, the output is HDR in a form the add-on cannot handle, the
+// shader cannot be loaded, or (in automatic mode) no pixel grid has been found yet. HDR
+// frames (scRGB, HDR10) are brought to SDR for the preset and back (see frame_renderer.h). Sets rd's status or error to describe
 // what happened.
 void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_view rtv, resource_view)
 {
@@ -634,11 +688,6 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
     }
 
     device *dev = runtime->get_device();
-    if (hdr_output(runtime))
-    {
-        set_error(*rd, "HDR output is not supported yet. Turn HDR off in the game to use RetroArch shaders.");
-        return;
-    }
     const bool ready = prepare(*rd, dev, runtime->get_command_queue());
     // Compiling a preset in prepare() can take seconds. Count effects as rendered when it
     // ends, or on_reshade_present, right after, would show "Paused" because of the compile.
@@ -653,11 +702,18 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
     const resource_desc desc = dev->get_resource_desc(target);
     rd->frame_w = int(desc.texture.width);
     rd->frame_h = int(desc.texture.height);
+    std::string err;
+    FrameColour colour = FrameColour::sdr;
+    if (!frame_colour(runtime, desc.texture.format, colour, err))
+    {
+        set_error(*rd, err);
+        return;
+    }
+    rd->colour = colour;
 
     // Take a snapshot: a copy of the frame as the game drew it, made before anything draws
     // over it. The renderer reads the low resolution picture from it, and the grid detector
     // analyses it.
-    std::string err;
     if (!rd->renderer.snapshot(cmd_list, target, err))
     {
         set_error(*rd, err);
@@ -711,7 +767,8 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
 
     // Extract the low resolution picture, run the preset on it and write the result over the
     // grid's rectangle of the back buffer. Pixels outside the rectangle are left as they are.
-    if (!rd->renderer.render(cmd_list, runtime->get_command_queue(), grid, rd->chain, target, rd->frame++, err))
+    if (!rd->renderer.render(cmd_list, runtime->get_command_queue(), grid, colour, g_settings.hdr, rd->chain, target,
+                             rd->frame++, err))
     {
         set_error(*rd, err);
         return;
@@ -719,7 +776,8 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
     rd->error.clear();
     // "(re-checking)": the frame size changed, and the detector is still confirming the grid
     // it rescaled from the old size.
-    rd->status = "Running on " + grid.describe() + (rd->detector.provisional() ? " (re-checking)" : "");
+    rd->status = "Running on " + grid.describe() + (rd->detector.provisional() ? " (re-checking)" : "") +
+                 (colour != FrameColour::sdr ? std::string(", ") + colour_name(colour) + " output" : "");
 }
 
 // ReShade event, once per frame, after ReShade has drawn its effects and its overlay, just
@@ -965,6 +1023,10 @@ bool draw_downsample(int frame_w, int frame_h)
         changed = true;
     }
     clamp_downsample(d);
+    reshade::get_config_value(nullptr, kSection, "HdrPaperWhite", g_settings.hdr.paper_white);
+    reshade::get_config_value(nullptr, kSection, "HdrPeak", g_settings.hdr.peak);
+    reshade::get_config_value(nullptr, kSection, "HdrExpandGamut", g_settings.hdr.expand_gamut);
+    clamp_hdr(g_settings.hdr);
     return changed;
 }
 
@@ -1005,6 +1067,37 @@ void draw_resolution(RuntimeData &rd)
     }
     if (changed)
         save_settings();
+}
+
+// Draws the overlay's "HDR" section: whether the game outputs HDR, and the paper white,
+// peak brightness and expand gamut settings used for HDR output (see output.slang).
+// Writes the settings to ReShade.ini when one changed.
+void draw_hdr(const RuntimeData &rd)
+{
+    if (rd.colour == FrameColour::sdr)
+        ImGui::TextWrapped("The game outputs SDR: these settings are not used. They apply when the game outputs HDR "
+                           "(its own HDR option, scRGB or HDR10).");
+    else
+        ImGui::TextWrapped("The game outputs %s. The shader runs in SDR; its result is shown with these settings.",
+                           colour_name(rd.colour));
+    HdrSettings &h = g_settings.hdr;
+    bool changed = false;
+    ImGui::SetNextItemWidth(240.0f);
+    changed |= ImGui::SliderFloat("Paper white (nits)", &h.paper_white, kHdrMinNits, 500.0f, "%.0f");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Brightness of the game's normal white, and of the shader's mid tones. RetroArch: 200.");
+    ImGui::SetNextItemWidth(240.0f);
+    changed |= ImGui::SliderFloat("Peak brightness (nits)", &h.peak, kHdrMinNits, 4000.0f, "%.0f");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Brightness of the shader's full white; set it to your screen's peak. RetroArch: 1000.");
+    changed |= ImGui::Checkbox("Expand gamut", &h.expand_gamut);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("More vivid colours: the SDR colours are shown as the wider DCI-P3 colours.");
+    if (changed)
+    {
+        clamp_hdr(h);
+        save_settings();
+    }
 }
 
 // Saves the current slider values into the companion .slangp. `target` is the preset on the
@@ -1113,6 +1206,8 @@ void draw_overlay(effect_runtime *runtime)
         draw_shader_picker(*rd);
     if (ImGui::CollapsingHeader("Game resolution"))
         draw_resolution(*rd);
+    if (ImGui::CollapsingHeader("HDR"))
+        draw_hdr(*rd);
     if (ImGui::CollapsingHeader("Shader parameters"))
         draw_parameters(*rd);
 }

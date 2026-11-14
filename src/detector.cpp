@@ -178,7 +178,9 @@ void GridDetector::tick(device *dev, command_queue *queue, resource frame, doubl
         f.width = int(readback_w_);
         f.height = int(readback_h_);
         f.pitch = data.row_pitch;
-        f.bytes_per_pixel = 4; // the snapshot is always a 32-bit format (FrameRenderer::supported_format)
+        // The snapshot is a 32-bit format, or 16-bit float RGBA (8 bytes) for scRGB HDR
+        // frames (FrameRenderer::supported_format).
+        f.bytes_per_pixel = readback_format_ == reshade::api::format::r16g16b16a16_float ? 8 : 4;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             job_frame_ = f;

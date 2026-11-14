@@ -54,7 +54,7 @@ public:
     // Depending on where the current detection is, it starts a copy of `frame`, passes a
     // finished copy to the worker, or collects the worker's result and updates grid().
     // `frame` holds the game's frame; it must be single-sample (not multisampled), 4 bytes
-    // per pixel, and in the shader_resource state. The add-on passes its snapshot, a copy
+    // per pixel or 16-bit float RGBA, and in the shader_resource state. The add-on passes its snapshot, a copy
     // of the frame it makes every frame (FrameRenderer::snapshot in frame_renderer.h).
     // Commands go to `queue`'s immediate command list. `now` is the current time in
     // seconds, used to space detections out.

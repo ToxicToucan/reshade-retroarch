@@ -336,6 +336,7 @@ bool FrameRenderer::supported_format(format f)
     case format::b8g8r8a8_unorm:
     case format::b8g8r8x8_unorm:
     case format::r10g10b10a2_unorm:
+    case format::r16g16b16a16_float:
         return true;
     default:
         return false;
@@ -374,13 +375,18 @@ void FrameRenderer::shutdown()
     queue_ = nullptr;
     capture_.destroy();
     capture_grid_ = PixelGrid();
+    capture_colour_ = FrameColour::sdr;
+    capture_paper_white_ = 0.0f;
+    output_.destroy();
+    output_colour_ = FrameColour::sdr;
     if (device_ != nullptr)
     {
         destroy(snap_, snap_srv_, snap_unused_);
         destroy(native_, native_rtv_, native_srv_);
         destroy(out_, out_rtv_, out_unused_);
+        destroy(sdr_, sdr_rtv_, sdr_srv_);
     }
-    snap_w_ = snap_h_ = native_w_ = native_h_ = out_w_ = out_h_ = 0;
+    snap_w_ = snap_h_ = native_w_ = native_h_ = out_w_ = out_h_ = sdr_w_ = sdr_h_ = 0;
     snap_format_ = out_format_ = format::unknown;
     device_ = nullptr;
 }
@@ -409,6 +415,8 @@ ChainImage FrameRenderer::chain_image(resource res, resource_view view, format f
         uint32_t gl_format = 0x8058; // GL_RGBA8
         if (format_to_default_typed(fmt, 0) == format::r10g10b10a2_unorm)
             gl_format = 0x8059; // GL_RGB10_A2
+        else if (format_to_default_typed(fmt, 0) == format::r16g16b16a16_float)
+            gl_format = 0x881A; // GL_RGBA16F
         return ChainImage{view.handle & 0xFFFFFFFF, view.handle, gl_format, width, height};
     }
     if (chain_device_.api == GraphicsApi::vulkan)
@@ -424,6 +432,9 @@ ChainImage FrameRenderer::chain_image(resource res, resource_view view, format f
             break;
         case format::r10g10b10a2_unorm:
             vk_format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            break;
+        case format::r16g16b16a16_float:
+            vk_format = VK_FORMAT_R16G16B16A16_SFLOAT;
             break;
         default: // r8g8b8a8_unorm
             break;
@@ -497,6 +508,51 @@ bool FrameRenderer::ensure_native(uint32_t w, uint32_t h, std::string &error)
     return true;
 }
 
+// The SDR picture of HDR frames: like the native picture, at the rectangle's size.
+bool FrameRenderer::ensure_sdr(uint32_t w, uint32_t h, std::string &error)
+{
+    if (sdr_.handle != 0 && sdr_w_ == w && sdr_h_ == h)
+        return true;
+    destroy(sdr_, sdr_rtv_, sdr_srv_);
+    const resource_desc desc(w, h, 1, 1, native_format(), 1, memory_heap::default_,
+                             resource_usage::render_target | resource_usage::shader_resource);
+    if (!device_->create_resource(desc, nullptr, resource_usage::shader_resource, &sdr_) ||
+        !device_->create_resource_view(sdr_, resource_usage::render_target, resource_view_desc(native_format()),
+                                       &sdr_rtv_) ||
+        !device_->create_resource_view(sdr_, resource_usage::shader_resource, resource_view_desc(native_format()),
+                                       &sdr_srv_))
+    {
+        destroy(sdr_, sdr_rtv_, sdr_srv_);
+        error = "could not create the SDR picture texture";
+        return false;
+    }
+    sdr_w_ = w;
+    sdr_h_ = h;
+    return true;
+}
+
+bool FrameRenderer::ensure_output_preset(FrameColour colour, const HdrSettings &hdr, std::string &error)
+{
+    if (!output_.ready())
+    {
+        const std::string preset = output_preset_path(error);
+        if (preset.empty() || !output_.create(chain_device_, preset, error))
+        {
+            error = "could not load the HDR output shader: " + error;
+            return false;
+        }
+        output_colour_ = FrameColour::sdr;
+    }
+    if (output_colour_ == colour && output_hdr_.paper_white == hdr.paper_white && output_hdr_.peak == hdr.peak &&
+        output_hdr_.expand_gamut == hdr.expand_gamut)
+        return true;
+    if (!set_output_params(output_, colour, hdr, error))
+        return false;
+    output_colour_ = colour;
+    output_hdr_ = hdr;
+    return true;
+}
+
 // The output texture is in the frame's format family (typeless, drawn through a plain
 // view) so it can be copied into the frame.
 bool FrameRenderer::ensure_output(uint32_t w, uint32_t h, format frame_format, std::string &error)
@@ -525,8 +581,7 @@ bool FrameRenderer::snapshot(command_list *cmd, resource frame, std::string &err
     const resource_desc fd = device_->get_resource_desc(frame);
     if (!supported_format(fd.texture.format))
     {
-        error = "unsupported back buffer format " + std::to_string(int(fd.texture.format)) +
-                " (HDR is not supported yet)";
+        error = "unsupported back buffer format " + std::to_string(int(fd.texture.format));
         return false;
     }
     if (fd.texture.samples > 1)
@@ -626,8 +681,9 @@ void FrameRenderer::transition(resource res, resource_usage before, resource_usa
         private_->transition(res, before, after);
 }
 
-bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelGrid &grid, ShaderChain &chain,
-                           resource dst, uint64_t frame_count, std::string &error)
+bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelGrid &grid, FrameColour colour,
+                           const HdrSettings &hdr, ShaderChain &chain, resource dst, uint64_t frame_count,
+                           std::string &error)
 {
     // Return an error without a snapshot or a valid grid, or with a grid whose rectangle
     // reaches outside the snapshot.
@@ -645,19 +701,32 @@ bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelG
     const uint32_t nw = uint32_t(grid.native_w), nh = uint32_t(grid.native_h);
     const uint32_t rw = uint32_t(grid.rect_w), rh = uint32_t(grid.rect_h);
     const format dst_format = device_->get_resource_desc(dst).texture.format;
-    if (!ensure_native(nw, nh, error) || !ensure_output(rw, rh, dst_format, error) || !set_capture_grid(grid, error))
+    const bool hdr_frame = colour != FrameColour::sdr;
+    if (hdr_frame && chain_device_.api == GraphicsApi::d3d9)
+    {
+        error = "HDR frames are not supported on Direct3D 9";
+        return false;
+    }
+    if (!ensure_native(nw, nh, error) || !ensure_output(rw, rh, dst_format, error) ||
+        !set_capture_grid(grid, colour, hdr, error) ||
+        (hdr_frame && (!ensure_sdr(rw, rh, error) || !ensure_output_preset(colour, hdr, error))))
         return false;
 
-    // Steps 1 and 2 run librashader, recorded where it may change any state (see the class
-    // comment). Both textures are switched to render targets here, on ReShade's list; the
-    // switches between and after the two steps are recorded next to them.
+    // Steps 1 and 2 (and 2b for HDR frames) run librashader, recorded where it may change
+    // any state (see the class comment). The textures are switched to render targets here,
+    // on ReShade's list; the switches between and after the steps are recorded next to
+    // them.
     cmd->barrier(native_, resource_usage::shader_resource, resource_usage::render_target);
     cmd->barrier(out_, resource_usage::copy_source, resource_usage::render_target);
+    if (hdr_frame)
+        cmd->barrier(sdr_, resource_usage::shader_resource, resource_usage::render_target);
     uint64_t commands = 0;
     if (!begin_librashader(cmd, queue, commands, error))
     {
         cmd->barrier(native_, resource_usage::render_target, resource_usage::shader_resource);
         cmd->barrier(out_, resource_usage::render_target, resource_usage::copy_source);
+        if (hdr_frame)
+            cmd->barrier(sdr_, resource_usage::render_target, resource_usage::shader_resource);
         return false;
     }
 
@@ -673,10 +742,21 @@ bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelG
 
     // Step 2: run the user's preset on the native picture, into out_, which is exactly the
     // size of the rectangle (librashader clears its whole output, so drawing straight into
-    // the frame would erase what surrounds the game picture).
-    ok = ok && chain.frame(commands, chain_image(native_, native_srv_, native_format(), nw, nh),
-                           chain_image(out_, out_rtv_, format_to_default_typed(dst_format, 0), rw, rh), 0, 0, int(rw),
-                           int(rh), frame_count, error);
+    // the frame would erase what surrounds the game picture). For an HDR frame, into sdr_
+    // instead, and step 2b: the output preset turns sdr_ into the frame's format, in out_.
+    const ChainImage out_image = chain_image(out_, out_rtv_, format_to_default_typed(dst_format, 0), rw, rh);
+    if (hdr_frame)
+    {
+        ok = ok && chain.frame(commands, chain_image(native_, native_srv_, native_format(), nw, nh),
+                               chain_image(sdr_, sdr_rtv_, native_format(), rw, rh), 0, 0, int(rw), int(rh),
+                               frame_count, error);
+        transition(sdr_, resource_usage::render_target, resource_usage::shader_resource);
+        ok = ok && output_.frame(commands, chain_image(sdr_, sdr_srv_, native_format(), rw, rh), out_image, 0, 0,
+                                 int(rw), int(rh), frame_count, error);
+    }
+    else
+        ok = ok && chain.frame(commands, chain_image(native_, native_srv_, native_format(), nw, nh), out_image, 0, 0,
+                               int(rw), int(rh), frame_count, error);
     transition(out_, resource_usage::render_target, resource_usage::copy_source);
     // Submit even after a failure: the list is open, and the transitions above must run
     // so the next frame starts from the states it is recorded for.
@@ -700,12 +780,22 @@ bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelG
     return true;
 }
 
-bool FrameRenderer::set_capture_grid(const PixelGrid &grid, std::string &error)
+bool FrameRenderer::set_capture_grid(const PixelGrid &grid, FrameColour colour, const HdrSettings &hdr,
+                                     std::string &error)
 {
-    if (grid.same_as(capture_grid_))
+    if (!grid.same_as(capture_grid_))
+    {
+        if (!set_capture_params(capture_, grid, error))
+            return false;
+        capture_grid_ = grid;
+    }
+    // The Shader Model 3 capture has no colour parameters; it only ever sees SDR frames.
+    const float paper_white = colour == FrameColour::sdr ? 0.0f : hdr.paper_white;
+    if (chain_device_.api == GraphicsApi::d3d9 || (colour == capture_colour_ && paper_white == capture_paper_white_))
         return true;
-    if (!set_capture_params(capture_, grid, error))
+    if (!set_capture_colour(capture_, colour, hdr, error))
         return false;
-    capture_grid_ = grid;
+    capture_colour_ = colour;
+    capture_paper_white_ = paper_white;
     return true;
 }

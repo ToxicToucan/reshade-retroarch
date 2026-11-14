@@ -7,6 +7,7 @@
 // code runs on every graphics API; only the librashader calls differ per API (chain.h).
 // Used only inside ReShade (addon.cpp).
 
+#include "capture.h"
 #include "chain.h"
 #include "grid_detect.h"
 
@@ -21,6 +22,9 @@
 //  2. render(): rebuild the native picture from the copy with the capture preset
 //     (capture.h), run the user's preset on it, and copy the result into the frame over
 //     the game picture's rectangle. Pixels outside that rectangle are never touched.
+//     For an HDR frame (scRGB or HDR10), the capture also brings the picture to SDR, the
+//     user's preset draws into an SDR texture, and the output preset (output.slang) turns
+//     that into the frame's HDR format before the copy.
 //
 // Resource states (the declared next use of a texture; required on D3D12 and Vulkan,
 // ignored elsewhere): between calls the snapshot and the native picture are in the
@@ -85,18 +89,21 @@ public:
     // Draws the shader-processed picture into `dst` (normally the frame given to
     // snapshot(), in the render_target state): rebuilds the native picture described by
     // `grid` from the last snapshot, runs `chain` on it into a texture the size of grid's
-    // rectangle, and copies that into `dst` at the rectangle's position. `frame_count` is
+    // rectangle, and copies that into `dst` at the rectangle's position. `colour` says how
+    // the frame is encoded; for HDR frames `hdr` sets the conversions to and from SDR
+    // (see the class comment; not on Direct3D 9, which has no HDR swap chains). `frame_count` is
     // the frame number passed to the shaders; it should go up by one each frame. Records
     // the commands on `cmd`, which must be `queue`'s immediate command list on Direct3D 12
     // and Vulkan (see the class comment). Returns false and sets `error` when there is no
     // snapshot, `grid` is invalid or reaches outside the snapshot, or a texture or a preset
     // fails.
     bool render(reshade::api::command_list *cmd, reshade::api::command_queue *queue, const PixelGrid &grid,
-                ShaderChain &chain, reshade::api::resource dst, uint64_t frame_count, std::string &error);
+                FrameColour colour, const HdrSettings &hdr, ShaderChain &chain, reshade::api::resource dst,
+                uint64_t frame_count, std::string &error);
 
     // True for the frame formats the capture can read: 8 bits per channel RGBA, BGRA or
-    // BGRX (plain, sRGB or typeless) and 10-bit RGB with 2-bit alpha. False for everything
-    // else, notably the 16-bit float formats used for HDR.
+    // BGRX (plain, sRGB or typeless), 10-bit RGB with 2-bit alpha (SDR or HDR10), and
+    // 16-bit float RGBA (scRGB HDR). False for everything else.
     static bool supported_format(reshade::api::format f);
 
 private:
@@ -110,9 +117,14 @@ private:
     bool ensure_snapshot(const reshade::api::resource_desc &frame, std::string &error);
     bool ensure_native(uint32_t w, uint32_t h, std::string &error);
     bool ensure_output(uint32_t w, uint32_t h, reshade::api::format frame_format, std::string &error);
-    // Passes the grid's rectangle and native size to the capture preset as its parameters,
-    // when they differ from the last ones passed. Returns false and sets `error` on failure.
-    bool set_capture_grid(const PixelGrid &grid, std::string &error);
+    bool ensure_sdr(uint32_t w, uint32_t h, std::string &error);
+    // For an HDR frame: compiles the output preset on first use and passes it `colour` and
+    // `hdr` when they changed. Returns false and sets `error` on failure.
+    bool ensure_output_preset(FrameColour colour, const HdrSettings &hdr, std::string &error);
+    // Passes the grid's rectangle and native size, and the frame's encoding, to the capture
+    // preset as its parameters, when they differ from the last ones passed. Returns false
+    // and sets `error` on failure.
+    bool set_capture_grid(const PixelGrid &grid, FrameColour colour, const HdrSettings &hdr, std::string &error);
     // Format for the renderer's copies of a frame of format `frame_format`: its typeless
     // family where the API has typeless formats, the frame's own format on Direct3D 9.
     reshade::api::format copy_format(reshade::api::format frame_format) const;
@@ -159,6 +171,13 @@ private:
     // The capture preset compiled for the device, and the grid last passed to it.
     ShaderChain capture_;
     PixelGrid capture_grid_;
+    FrameColour capture_colour_ = FrameColour::sdr;
+    float capture_paper_white_ = 0.0f;
+    // The output preset (HDR frames only), compiled on first use, and the values last
+    // passed to it (output_colour_ sdr: none yet).
+    ShaderChain output_;
+    FrameColour output_colour_ = FrameColour::sdr;
+    HdrSettings output_hdr_;
 
     // The snapshot: a copy of the frame, created typeless (see ensure_snapshot) and read by
     // the capture preset through snap_srv_ as plain (non-sRGB) values.
@@ -179,4 +198,10 @@ private:
     reshade::api::resource_view out_rtv_ = {}, out_unused_ = {};
     uint32_t out_w_ = 0, out_h_ = 0;
     reshade::api::format out_format_ = reshade::api::format::unknown; // the frame format it was made for
+
+    // HDR frames only: the user's preset's SDR output (8-bit, the native picture's format),
+    // the size of the grid's rectangle, read by the output preset.
+    reshade::api::resource sdr_ = {};
+    reshade::api::resource_view sdr_rtv_ = {}, sdr_srv_ = {};
+    uint32_t sdr_w_ = 0, sdr_h_ = 0;
 };
