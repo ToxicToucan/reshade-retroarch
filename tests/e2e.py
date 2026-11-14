@@ -19,8 +19,9 @@ Scenario, the same on every API:
   3. switch to another, then drop a .slangp next to it  -> untouched, then hot-reloaded (4)
   5. game switches to 4:3 pillarbox with HD side art    -> new grid, side art untouched
   6. back buffer resized to 1080p                       -> the shader's output
-Separate runs: 7. 10-bit back buffer, 8. HDR10 output, 10. sRGB back buffer, and
-9. librashader.dll missing. A format the host cannot draw on an API is reported as n/a.
+Separate runs: 7. 10-bit back buffer, 8. HDR10 output, 10. sRGB back buffer,
+12. Downsample mode (256x224, cropped to the 4:3 picture of the pillarbox frame: the
+average of the picture, side art untouched), and 9. librashader.dll missing. A format the host cannot draw on an API is reported as n/a.
 On Direct3D 12 also 11: DirectX's shader compiler missing (untouched, no crash).
 
 Exact runs (E1-E3), on supported APIs: the same frames with tests/presets/nearest.slangp,
@@ -87,6 +88,13 @@ RESHADE_NAME = {"d3d9": "d3d9.dll", "d3d10": "d3d10.dll", "d3d11": "d3d11.dll", 
 # that frames stay untouched must match byte for byte on every API.
 ROUNDING_MEAN = 0.5
 ROUNDING_FRACTION = 1e-3
+
+# The Downsample run (12): its settings in ReShade.ini, and the same as render_png options
+# for its offline render.
+DOWNSAMPLE_INI = ("[RetroArchShaders]\nNativeMode=3\nDownsampleWidth=256\nDownsampleHeight=224\n"
+                  "DownsampleStretch=0\nDownsampleCropLeft=12.5\nDownsampleCropTop=0\nDownsampleCropRight=12.5\n"
+                  "DownsampleCropBottom=0\n")
+DOWNSAMPLE_ARGS = ["--grid", "down:256x224", "--crop", "12.5,0,12.5,0"]
 
 
 # Validation layer messages that are not the add-on's (checked by running without it):
@@ -212,6 +220,18 @@ def prepare_common(args, common):
             if r.returncode == 0:
                 continue
             message = f"offline render of {name} with {companion} {extra} failed: {(r.stdout + r.stderr).strip()}"
+            if api == "d3d11":
+                sys.exit(message)
+            failed[api] = message
+    # The Downsample run's offline render (preset A, pillarbox frame), on each API above.
+    for api, companion, prefix, extra in renders:
+        if companion != "A.slangp" or api in failed:
+            continue
+        r = subprocess.run([os.path.join(common, "render_png.exe"), os.path.join(common, companion),
+                            os.path.join(common, "pillar4k.png"), os.path.join(common, prefix + "down_pillar4k.png"),
+                            *extra, *DOWNSAMPLE_ARGS], capture_output=True, text=True, cwd=common)
+        if r.returncode != 0:
+            message = f"offline Downsample render with {extra} failed: {(r.stdout + r.stderr).strip()}"
             if api == "d3d11":
                 sys.exit(message)
             failed[api] = message
@@ -397,6 +417,26 @@ def run_api(args, api, work, common, results, reference_error=None):
         na("10 sRGB back buffer           ", f"the host cannot draw it: {err}")
     else:
         check("10 sRGB back buffer           ", w("shots", "10.png"), expected("exp_full4k.png"), c("full4k.png"))
+
+    # Downsample mode, from the settings in ReShade.ini: the pillarbox frame's 4:3 picture
+    # averaged down to 256x224 (not its native 320x240, so the result differs from the
+    # automatic mode's); the side art must stay untouched.
+    with open(w("ReShade.ini"), encoding="utf-8") as f:
+        ini = f.read()
+    with open(w("ReShade.ini"), "a", encoding="utf-8") as f:
+        f.write("\n" + DOWNSAMPLE_INI)
+    code, err = host(300, f"250:shot={w('shots', '12.png')}", "--image", "0:" + c("pillar4k.png"))
+    with open(w("ReShade.ini"), "w", encoding="utf-8") as f:
+        f.write(ini)
+    if code != 0:
+        add(False, "12 Downsample 256x224, 4:3 crop", f"test host exit {code}: {err}")
+    else:
+        check("12 Downsample 256x224, 4:3 crop", w("shots", "12.png"), expected("exp_down_pillar4k.png"),
+              c("pillar4k.png"))
+        if os.path.exists(w("shots", "12.png")):
+            s, src = load(w("shots", "12.png")), load(c("pillar4k.png"))
+            ok = bool((s[:, :480] == src[:, :480]).all() and (s[:, 3360:] == src[:, 3360:]).all())
+            add(ok, "12 side art untouched         ", "exact" if ok else "changed")
 
     if api == "d3d12" and supported:
         # Without DirectX's shader compiler: untouched, reason logged, and no crash.
