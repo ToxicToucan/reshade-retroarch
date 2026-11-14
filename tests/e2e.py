@@ -19,7 +19,9 @@ Scenario, the same on every API:
   3. switch to another, then drop a .slangp next to it  -> untouched, then hot-reloaded (4)
   5. game switches to 4:3 pillarbox with HD side art    -> new grid, side art untouched
   6. back buffer resized to 1080p                       -> the shader's output
-Separate runs: 7. 10-bit back buffer, 8. HDR10 output, 10. sRGB back buffer,
+Separate runs: 7. 10-bit back buffer, 8. HDR10 output (with the exact preset below: the
+picture brought to SDR, the preset's result shown in HDR10, checked against a model of
+capture.slang and output.slang, see hdr10_expected()), 10. sRGB back buffer,
 12. Downsample mode (256x224, cropped to the 4:3 picture of the pillarbox frame: the
 average of the picture, side art untouched), and 9. librashader.dll missing. A format the host cannot draw on an API is reported as n/a.
 On Direct3D 12 also 11: DirectX's shader compiler missing (untouched, no crash).
@@ -129,6 +131,43 @@ def validation_errors(text):
 
 def load(path):
     return np.asarray(Image.open(path).convert("RGB")).astype(int)
+
+
+# PQ (SMPTE ST 2084) constants, as in capture.slang and output.slang.
+PQ_M1, PQ_M2, PQ_C1, PQ_C2, PQ_C3 = 0.1593017578125, 78.84375, 0.8359375, 18.8515625, 18.6875
+BT2020_TO_709 = np.array([[1.660491, -0.587641, -0.072850], [-0.124550, 1.132900, -0.008349],
+                          [-0.018151, -0.100579, 1.118730]])
+P3_TO_2020 = np.array([[0.753833, 0.198597, 0.047570], [0.045744, 0.941777, 0.012479],
+                       [-0.001210, 0.017602, 0.983609]])
+
+
+def hdr10_expected(exact_sdr, paper_white=200.0, peak=1000.0):
+    """What the add-on shows in an HDR10 run with tests/presets/nearest.slangp and the
+    default HDR settings (paper white 200, peak 1000, expand gamut on), as the test host's
+    screenshot gives it (top 8 bits of each 10-bit channel), computed from `exact_sdr`, the
+    same frame's exact SDR render (255 - the native pixel shown at each pixel).
+    The host draws an 8-bit value v as round(v * 1023 / 255); the capture decodes that as
+    PQ, divides by paper white, converts BT.2020 to BT.709, clips to 0..1 and encodes with
+    a 2.2 curve into the 8-bit native picture; the preset inverts it; the output pass
+    decodes with 2.2, applies the inverse tone map, takes the colours as DCI-P3, converts
+    to BT.2020 and encodes with PQ into 10 bits."""
+    v = 255 - exact_sdr.astype(np.float64)
+    e = np.round(v * 1023 / 255) / 1023
+    p = e ** (1 / PQ_M2)
+    lin = (np.maximum(p - PQ_C1, 0) / (PQ_C2 - PQ_C3 * p)) ** (1 / PQ_M1) * 10000 / paper_white
+    lin = np.clip(lin @ BT2020_TO_709.T, 0, 1)
+    native = np.round(lin ** (1 / 2.2) * 255)
+    c = ((255 - native) / 255) ** 2.2
+    m = peak / paper_white
+    lum = c @ np.array([0.2126, 0.7152, 0.0722])
+    k = 0.5 * (m - 0.5) / (m - 1)
+    t = lum - 0.5
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = np.where(lum > 0.5, (0.5 + t / (1 - t / k)) / lum, 1.0)
+    rgb = (c * scale[..., None] * paper_white) @ P3_TO_2020.T / 10000
+    q = np.clip(rgb, 0, 1) ** PQ_M1
+    out = ((PQ_C1 + PQ_C2 * q) / (1 + PQ_C3 * q)) ** PQ_M2
+    return (np.round(out * 1023).astype(int) >> 2)
 
 
 def compare(a, b):
@@ -403,14 +442,25 @@ def run_api(args, api, work, common, results, reference_error=None):
         close("7 10-bit back buffer          ", w("shots", "7.png"),
               expected("exp_full4k.png") if supported else c("full4k.png"))
 
-    code, err = host(300, f"250:shot={w('shots', '8.png')}", "--format", "rgb10a2", "--hdr10", "1",
-                     "--image", "0:" + c("full4k.png"))
+    # ReShade saves the preset switch to N in ReShade.ini; put the file back afterwards so
+    # the runs below start on A again.
+    with open(w("ReShade.ini"), encoding="utf-8") as f:
+        ini = f.read()
+    code, err = host(300, f"1:preset={w('presets', 'N.ini')};250:shot={w('shots', '8.png')}", "--format", "rgb10a2",
+                     "--hdr10", "1", "--image", "0:" + c("full4k.png"))
+    with open(w("ReShade.ini"), "w", encoding="utf-8") as f:
+        f.write(ini)
     if code == 3:
         na("8 HDR10 output                ", f"the host cannot draw it: {err}")
-    else:
+    elif not supported:
         close("8 HDR10 output untouched      ", w("shots", "8.png"), c("full4k.png"))
-        reason = "HDR output is not supported" if supported else "is not supported"
-        add(log_has(reason), "8 reason in ReShade.log       ", reason)
+        add(log_has("is not supported"), "8 reason in ReShade.log       ", "is not supported")
+    elif not os.path.exists(w("shots", "8.png")):
+        add(False, "8 HDR10 output                ", "no screenshot")
+    else:
+        # Within one 8-bit step of the model: the GPU's pow and PQ maths round differently.
+        d = np.abs(load(w("shots", "8.png")) - hdr10_expected(load(expected("exact_full4k.png"))))
+        add(int(d.max()) <= 1, "8 HDR10 output                ", f"vs model: max {int(d.max())}, mean {d.mean():.3f}")
 
     code, err = host(300, f"250:shot={w('shots', '10.png')}", "--format", "rgba8srgb", "--image", "0:" + c("full4k.png"))
     if code == 3:
