@@ -249,7 +249,10 @@ does not work as administrator):
 python tests/e2e.py --reshade <ReShade64.dll> --librashader <librashader.dll> --shaders <slang-shaders> --preset <preset> --native <native.png>
 ```
 
-If a ReShade Vulkan layer is installed system-wide (ReShade's setup for a Vulkan game puts one in `C:\ProgramData\ReShade`), it loads instead of the one under test and the Vulkan part fails with no screenshots; run the test with `VK_LOADER_LAYERS_DISABLE=~implicit~` set.
+If a ReShade Vulkan layer is installed system-wide (ReShade's setup for a Vulkan game puts
+one in `C:\ProgramData\ReShade`), it loads instead of the one under test and the Vulkan
+part fails with no screenshots; run the test with `VK_LOADER_LAYERS_DISABLE=~implicit~`
+set.
 
 `tests/ci_deps.py <folder>` downloads what CI uses (pinned versions).
 
