@@ -72,9 +72,71 @@ ShaderPaths=D:\my-shaders;E:\more-shaders
 | **Detect automatically** | Finds the native resolution and where the picture sits, and follows resizes, resolution changes and 4:3/16:9 toggles. During menus, fades and title cards, the last good grid stays in use. |
 | **Fixed** | Uses the width × height you type for the whole frame. |
 | **Whole frame** | Runs the shader on the whole frame as it is. |
+| **Downsample** | Averages the frame down to the width × height you choose (default 320×240), then runs the shader on that. For 3D games and smoothly upscaled games, which have no pixel grid to find. See [3D games and PS1-style games](#3d-games-and-ps1-style-games). |
 
 The window shows the grid in use, for example
-`Running on 424x240 in 3840x2160 at (0,0), match 100%`.
+`Running on 424x240 in 3840x2160 at (0,0), match 100%`, or in Downsample mode
+`Running on 427x240 in 3840x2160 at (0,0), averaged`.
+
+## 3D games and PS1-style games
+
+A 3D game drawn at your screen's resolution has no low-resolution picture inside it to
+find, and **Fixed** takes one pixel per block, which gives jagged edges and shimmering.
+**Downsample** instead averages every block of pixels into one (an area average), like
+rendering at the low resolution with heavy anti-aliasing, so the CRT shader gets a clean,
+smooth low-resolution picture.
+
+**Game resolution → Downsample**, then:
+
+- **Size:** pick one of the buttons (320x240, 256x224, 320x224, 384x224, 640x480) or type
+  a width and height. The size is for a 4:3 picture; the number of lines (the height) is
+  what matters most for scanlines.
+- **Keep the game's shape** (on by default): a wider picture keeps its shape and gets more
+  columns at the same pixel width, so a 16:9 game at 320x240 runs on 427x240. Off: always
+  exactly the width × height you chose, squeezed to fit.
+- **Crop:** for games with black bars or a border drawn into the picture, leave out a
+  percentage of the frame at each edge. **Crop to 4:3 in the middle** sets it for a 4:3
+  picture centred in a wider window. Cropped edges are left untouched.
+
+Settings are saved in `ReShade.ini` (`[RetroArchShaders]`: `NativeMode=3`,
+`DownsampleWidth`, `DownsampleHeight`, `DownsampleStretch`, `DownsampleCropLeft`, ...),
+like the other resolution settings.
+
+Which size to pick:
+
+| Game | Size |
+|---|---|
+| N64-style 3D (and Ship of Harkinian, below) | 320×240 |
+| PS1-style 3D | 320×240 (or 256×224 / 640×480 for games that used them) |
+| SNES-style pixel art, smoothly upscaled | 256×224 |
+| Mega Drive-style pixel art, smoothly upscaled | 320×224 |
+| Arcade (CPS-style) | 384×224 |
+
+Pixel art that is upscaled sharply (each pixel a block of the same colour) works best with
+**Detect automatically**, which finds the exact grid; use Downsample when detection never
+finds one.
+
+### Example: Ship of Harkinian (Ocarina of Time)
+
+Ship of Harkinian draws its 3D at the full window resolution with Direct3D 11 (default) or
+OpenGL. To run a CRT preset on it as on an N64:
+
+1. Install ReShade for `soh.exe` with **full add-on support**, choosing Direct3D 10/11/12
+   (or OpenGL if you switched the game to it).
+2. Extract `RetroArchShaders-<version>.zip` into the game's folder, next to `soh.exe`.
+3. If your shaders are in a RetroArch install elsewhere, add the folder to `ReShade.ini`:
+   ```ini
+   [RetroArchShaders]
+   ShaderPaths=C:\path\to\RetroArch\shaders
+   ```
+4. Start the game, press **Home**, open **RetroArch Shaders**, pick a CRT preset (for
+   example `crt-guest-advanced-ntsc`) and press **Use for this ReShade preset**.
+5. **Game resolution → Downsample**, press **320x240**. With the game in widescreen this
+   runs on 427x240; for a 4:3 picture with bars at the sides, press **Crop to 4:3 in the
+   middle**.
+
+Lower the game's own internal resolution or turn off its anti-aliasing if you like; the
+add-on averages whatever the game draws.
 
 ## FAQ
 
@@ -144,7 +206,13 @@ The RetroArch Shaders window and `ReShade.log` show what is happening.
 - On Vulkan, each preset reload uses a little GPU memory that is only freed when the game
   closes.
 - No HDR content (see FAQ).
-- Automatic detection needs sharp pixels. For smoothly upscaled games, use **Fixed**.
+- Automatic detection needs sharp pixels. For smoothly upscaled games and 3D, use
+  **Downsample**.
+- On Direct3D 9, Downsample averages exactly only while each small pixel covers at most 16
+  frame pixels across and down (320×240 from frames up to about 4800×3600); above that it
+  averages 16 × 16 samples per small pixel instead of every pixel.
+- Downsample averages the values the game stored (gamma-encoded, as RetroArch passes a
+  core's picture to a preset), not linear light.
 - Bezel shaders only cover the game area.
 
 ## Build and test
@@ -166,6 +234,7 @@ fetches the pinned `librashader.dll`.
 | `out/build/detect_test --rules` | Which detections may replace the grid in use. |
 | `python tests/host_selftest.py` | The test host (a stand-in game for D3D9/10/11/12, OpenGL and Vulkan) shows its pictures byte for byte on every API and format. |
 | `out/build/files_test`, `out/build/params_test` | Preset files, discovery, saving parameters. |
+| `python tests/downsample_test.py` | Downsample mode's average against numpy's, offline on Direct3D 11, 12 and 9 (needs a GPU). |
 | `python tests/e2e.py ...` | The add-on inside real ReShade, on each graphics API. |
 | `python tests/compat_sweep.py ...` | Loads every preset in a shader folder. |
 
@@ -179,6 +248,8 @@ does not work as administrator):
 ```
 python tests/e2e.py --reshade <ReShade64.dll> --librashader <librashader.dll> --shaders <slang-shaders> --preset <preset> --native <native.png>
 ```
+
+If a ReShade Vulkan layer is installed system-wide (ReShade's setup for a Vulkan game puts one in `C:\ProgramData\ReShade`), it loads instead of the one under test and the Vulkan part fails with no screenshots; run the test with `VK_LOADER_LAYERS_DISABLE=~implicit~` set.
 
 `tests/ci_deps.py <folder>` downloads what CI uses (pinned versions).
 
@@ -199,6 +270,16 @@ Then pass `--vulkan-validation C:\VulkanSDK\1.4.363.0\Bin`.
 [docs/assumptions.md](docs/assumptions.md) lists what the add-on relies on in ReShade,
 librashader and the graphics APIs beyond their documentation, and how each is checked.
 Re-run the end-to-end tests on every API after updating ReShade or librashader.
+
+## Later
+
+Ideas not built yet:
+
+- **Leave the game's HUD out of the shader:** keep text and interface drawn at full
+  resolution sharp while the CRT shader runs on the 3D scene underneath (needs a way to
+  tell them apart, for example the depth buffer, or a mask the user draws).
+- **Find black bars in Downsample mode:** use the bar search of automatic detection to set
+  the crop by itself, instead of a percentage typed by hand.
 
 ## Licence
 
