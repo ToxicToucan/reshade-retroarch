@@ -160,11 +160,17 @@ The resolution in use is wrong. Same fix as above.
 
 ### Does it work with HDR?
 
-- **HDR screen, SDR game:** yes. This is the usual case: Windows shows the game's normal
-  picture on the HDR screen, and the add-on works on that picture.
-- **HDR content** (the game's own HDR option turned on): no. RetroArch shaders are
-  written for SDR, so the add-on leaves the picture untouched and shows a message. Turn the
-  game's HDR option off.
+- **HDR content** (the game's own HDR option turned on, scRGB or HDR10): yes. The shader
+  runs in SDR as in RetroArch, and its result is shown in HDR with an inverse tone map:
+  open **HDR** in the window and set **Paper white** (default 200 nits), **Peak brightness**
+  (your screen's peak, default 1000) and **Expand gamut** (default on), like RetroArch's HDR
+  settings. CRT masks and scanlines cost a lot of light, and this gives it back.
+- **HDR screen, SDR game:** the shader works, but its output stays SDR, so it can look
+  dim. Turn on Windows HDR, run the game borderless or fullscreen, and raise **SDR content
+  brightness** in Windows' display settings, or try Windows Auto HDR or NVIDIA RTX HDR,
+  which convert the finished frame. The add-on does not turn SDR games into HDR itself;
+  [docs/hdr.md](docs/hdr.md) explains why.
+- HDR with the HLG curve is not supported (the picture is left untouched, with a message).
 
 ### My game uses Direct3D 12 and nothing happens
 
@@ -190,7 +196,7 @@ The RetroArch Shaders window and `ReShade.log` show what is happening.
 | `Paused: ReShade is not rendering effects` | Effects are toggled off, or `reshade-shaders\Shaders\RetroArchShaders.fx` is missing. |
 | `Waiting: looking for the game's pixels` | Needs a scene with detail. Use **Fixed** if it never finds one. |
 | Red error under the shader name | The preset failed to load. Check it in RetroArch. |
-| `HDR output is not supported yet` | Turn the game's HDR option off. |
+| `HDR output with the HLG curve is not supported` | Use HDR10 or scRGB in the game, or turn its HDR off. |
 | `Direct3D 12 needs dxcompiler.dll and dxil.dll` | Add Microsoft's DirectX Shader Compiler: step 4 of [Install](#install). |
 | `... is not supported yet` | The game uses a graphics API the add-on does not support yet (see Limitations). |
 | `Vulkan: could not find ...` or `Vulkan: the game's Vulkan queue could be in several ...` | The add-on could not find what it needs on the game's GPU (see Limitations). Please report it with `ReShade.log`. |
@@ -205,7 +211,8 @@ The RetroArch Shaders window and `ReShade.log` show what is happening.
   game, it leaves it untouched and shows why.
 - On Vulkan, each preset reload uses a little GPU memory that is only freed when the game
   closes.
-- No HDR content (see FAQ).
+- HDR: the shader runs in SDR and is converted to HDR afterwards; presets written for HDR
+  (for example Sony Megatron's) run in their SDR mode. No HLG. SDR games stay SDR (see FAQ).
 - Automatic detection needs sharp pixels. For smoothly upscaled games and 3D, use
   **Downsample**.
 - On Direct3D 9, Downsample averages exactly only while each small pixel covers at most 16
@@ -281,6 +288,9 @@ Ideas not built yet:
 - **Leave the game's HUD out of the shader:** keep text and interface drawn at full
   resolution sharp while the CRT shader runs on the 3D scene underneath (needs a way to
   tell them apart, for example the depth buffer, or a mask the user draws).
+- **HDR presets in their HDR mode:** run presets written for HDR (Sony Megatron's) with
+  librashader's HDR options and their output straight into the HDR frame, instead of
+  converting an SDR result (see [docs/hdr.md](docs/hdr.md)).
 - **Find black bars in Downsample mode:** use the bar search of automatic detection to set
   the crop by itself, instead of a percentage typed by hand.
 

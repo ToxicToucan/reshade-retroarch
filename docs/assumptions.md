@@ -92,6 +92,16 @@ including the one the add-on creates (see librashader below). ReShade 6.8 only l
 - **Where:** `vulkan_handles` (`src/vulkan_support.cpp`).
 - **Guard: tested** (Vulkan end-to-end run, with Steam's layers installed too).
 
+### HDR: the swap chain's colour space is what ReShade reports
+The add-on reads the colour space from `swapchain::get_color_space()` (recorded in
+`init_swapchain`) to tell HDR10 from SDR 10-bit back buffers. A game that changes its
+colour space after creating the swap chain (`SetColorSpace1`) is seen through ReShade's
+hook of that call. A 16-bit float back buffer is always taken as scRGB, whatever is
+reported, because that is how Windows shows it.
+- **Where:** `frame_colour` (`src/addon.cpp`), see [hdr.md](hdr.md).
+- **Guard: tested** for HDR10 (end-to-end run 8 on Direct3D 11, 12 and Vulkan); scRGB
+  documented only (the test host cannot draw 16-bit float back buffers).
+
 ## librashader
 
 ### Direct3D 12 and Vulkan: per-frame objects are reused after `frames_in_flight` frames
