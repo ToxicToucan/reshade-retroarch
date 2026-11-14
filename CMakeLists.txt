@@ -32,6 +32,7 @@ add_library(rra_core STATIC
     src/discovery.cpp
     src/companion.cpp
     src/capture.cpp
+    src/downsample.cpp
     src/vulkan_support.cpp)
 target_include_directories(rra_core PUBLIC src ${GEN})
 # Third-party headers are "external": warnings in them are not reported.

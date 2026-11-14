@@ -14,6 +14,7 @@
 #include "companion.h"
 #include "detector.h"
 #include "discovery.h"
+#include "downsample.h"
 #include "librashader_api.h"
 #include "frame_renderer.h"
 #include "utf8.h"
@@ -47,6 +48,7 @@ enum NativeMode : int
     native_auto = 0,   // "Detect automatically": GridDetector (detector.h) finds the grid
     native_manual = 1, // "Fixed": the whole frame, as manual_w x manual_h original pixels
     native_frame = 2,  // "Whole frame": nothing is recovered; the preset runs on the full frame as is
+    native_downsample = 3, // "Downsample": the frame averaged down to a chosen size (downsample.h)
 };
 
 // Settings shared by every game window, stored in the global ReShade.ini, section
@@ -55,6 +57,7 @@ struct Settings
 {
     int mode = native_auto;             // a NativeMode value
     int manual_w = 320, manual_h = 240; // original resolution used in "Fixed" mode
+    DownsampleSettings downsample;      // size, shape and crop used in "Downsample" mode
     std::vector<fs::path> extra_paths;  // extra folders to search for presets (ShaderPaths=)
 };
 
@@ -90,6 +93,7 @@ struct RuntimeData
     // yet given to the detector.
     bool detect_pending = false;
     uint64_t frame = 0; // frames rendered; passed to the shaders, which may animate with it
+    int frame_w = 0, frame_h = 0; // size of the last frame on_begin_effects saw, for the overlay
     // Times in seconds (now_seconds()): next on-disk check of the companion file, last time
     // on_begin_effects ran, and last time the runtime was initialised or reloaded its effects.
     double next_file_check = 0, last_effects = 0, created = 0;
@@ -176,9 +180,19 @@ std::string trim(const std::string &s)
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
+// Keeps the Downsample settings within their limits (downsample.h).
+void clamp_downsample(DownsampleSettings &d)
+{
+    d.target_w = std::clamp(d.target_w, kDownsampleMinSize, kDownsampleMaxWidth);
+    d.target_h = std::clamp(d.target_h, kDownsampleMinSize, kDownsampleMaxHeight);
+    for (float *c : {&d.crop_left, &d.crop_top, &d.crop_right, &d.crop_bottom})
+        *c = std::isfinite(*c) ? std::clamp(*c, 0.0f, kDownsampleMaxCrop) : 0.0f;
+}
+
 // Reads the settings from the global ReShade.ini into g_settings. Only the first call does
 // anything. Out-of-range values are corrected: an unknown mode becomes automatic detection,
-// and the "Fixed" size is clamped to 16..7680 x 16..4320.
+// the "Fixed" and "Downsample" sizes are clamped to 16..7680 x 16..4320, and each crop to
+// 0..kDownsampleMaxCrop percent.
 // This and save_settings() use the global file (runtime argument nullptr), not a runtime's
 // own configuration: writing to a runtime's configuration makes ReShade reload all of it,
 // which can switch presets.
@@ -190,10 +204,19 @@ void load_settings()
     reshade::get_config_value(nullptr, kSection, "NativeMode", g_settings.mode);
     reshade::get_config_value(nullptr, kSection, "NativeWidth", g_settings.manual_w);
     reshade::get_config_value(nullptr, kSection, "NativeHeight", g_settings.manual_h);
-    if (g_settings.mode < native_auto || g_settings.mode > native_frame)
+    DownsampleSettings &d = g_settings.downsample;
+    reshade::get_config_value(nullptr, kSection, "DownsampleWidth", d.target_w);
+    reshade::get_config_value(nullptr, kSection, "DownsampleHeight", d.target_h);
+    reshade::get_config_value(nullptr, kSection, "DownsampleStretch", d.stretch);
+    reshade::get_config_value(nullptr, kSection, "DownsampleCropLeft", d.crop_left);
+    reshade::get_config_value(nullptr, kSection, "DownsampleCropTop", d.crop_top);
+    reshade::get_config_value(nullptr, kSection, "DownsampleCropRight", d.crop_right);
+    reshade::get_config_value(nullptr, kSection, "DownsampleCropBottom", d.crop_bottom);
+    if (g_settings.mode < native_auto || g_settings.mode > native_downsample)
         g_settings.mode = native_auto;
     g_settings.manual_w = std::clamp(g_settings.manual_w, 16, 7680);
     g_settings.manual_h = std::clamp(g_settings.manual_h, 16, 4320);
+    clamp_downsample(d);
 
     // ShaderPaths: extra folders to search for presets. The first call gets the value's
     // size. ReShade splits values on ',' and returns the parts separated by '\0', so '\0',
@@ -221,13 +244,21 @@ void load_settings()
     }
 }
 
-// Writes the resolution mode and the "Fixed" width and height from g_settings to the global
-// ReShade.ini. ShaderPaths is never written: only the user edits it.
+// Writes the resolution mode, the "Fixed" width and height and the "Downsample" settings from
+// g_settings to the global ReShade.ini. ShaderPaths is never written: only the user edits it.
 void save_settings()
 {
     reshade::set_config_value(nullptr, kSection, "NativeMode", g_settings.mode);
     reshade::set_config_value(nullptr, kSection, "NativeWidth", g_settings.manual_w);
     reshade::set_config_value(nullptr, kSection, "NativeHeight", g_settings.manual_h);
+    const DownsampleSettings &d = g_settings.downsample;
+    reshade::set_config_value(nullptr, kSection, "DownsampleWidth", d.target_w);
+    reshade::set_config_value(nullptr, kSection, "DownsampleHeight", d.target_h);
+    reshade::set_config_value(nullptr, kSection, "DownsampleStretch", d.stretch);
+    reshade::set_config_value(nullptr, kSection, "DownsampleCropLeft", d.crop_left);
+    reshade::set_config_value(nullptr, kSection, "DownsampleCropTop", d.crop_top);
+    reshade::set_config_value(nullptr, kSection, "DownsampleCropRight", d.crop_right);
+    reshade::set_config_value(nullptr, kSection, "DownsampleCropBottom", d.crop_bottom);
 }
 
 // Starts a background search for shader presets (see Scan), unless one is already running.
@@ -620,6 +651,8 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
     if (target.handle == 0)
         return;
     const resource_desc desc = dev->get_resource_desc(target);
+    rd->frame_w = int(desc.texture.width);
+    rd->frame_h = int(desc.texture.height);
 
     // Take a snapshot: a copy of the frame as the game drew it, made before anything draws
     // over it. The renderer reads the low resolution picture from it, and the grid detector
@@ -649,6 +682,11 @@ void on_begin_effects(effect_runtime *runtime, command_list *cmd_list, resource_
             rd->status = "Waiting: " + rd->detector.status();
             return; // show the game untouched until its pixels are found
         }
+    }
+    else if (g_settings.mode == native_downsample)
+    {
+        // Downsample: the frame (minus any crop) averaged down to the configured size.
+        grid = downsample_grid(int(desc.texture.width), int(desc.texture.height), g_settings.downsample);
     }
     else
     {
@@ -866,11 +904,75 @@ void draw_shader_picker(RuntimeData &rd)
     ImGui::EndDisabled();
 }
 
-// Draws the overlay's "Game resolution" section: the three modes (see NativeMode), the
-// width and height for "Fixed" (kept within 16..7680 x 16..4320), and in automatic mode the
-// detector's state and a "Detect again" button that clears its grid and searches again.
-// Writes the settings to ReShade.ini when any of them changed. The settings are global:
-// they apply to every game window at once.
+// Draws the "Downsample" settings (see DownsampleSettings in downsample.h): one-click
+// targets, the target width and height, whether to keep the game's shape, and the crop at
+// each edge, with buttons to crop the current frame (`frame_w` x `frame_h`, 0 if unknown)
+// to 4:3 in the middle or to remove the crop. Returns true if any setting changed.
+bool draw_downsample(int frame_w, int frame_h)
+{
+    DownsampleSettings &d = g_settings.downsample;
+    bool changed = false;
+    static const int targets[][2] = {{320, 240}, {256, 224}, {320, 224}, {384, 224}, {640, 480}};
+    for (size_t i = 0; i < std::size(targets); ++i)
+    {
+        const std::string label = std::to_string(targets[i][0]) + "x" + std::to_string(targets[i][1]);
+        if (i > 0)
+            ImGui::SameLine();
+        if (ImGui::Button(label.c_str()))
+        {
+            d.target_w = targets[i][0];
+            d.target_h = targets[i][1];
+            changed = true;
+        }
+    }
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::InputInt("Width##downsample", &d.target_w);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::InputInt("Height##downsample", &d.target_h);
+    bool keep_shape = !d.stretch;
+    if (ImGui::Checkbox("Keep the game's shape", &keep_shape))
+    {
+        d.stretch = !keep_shape;
+        changed = true;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("On: the width is for a 4:3 picture; a wider picture gets more columns (16:9 at 320x240 "
+                          "becomes 427x240).\nOff: always exactly width x height, squeezed to fit.");
+    ImGui::TextDisabled("Crop (percent of the frame), for black bars or borders:");
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::SliderFloat("Left", &d.crop_left, 0.0f, kDownsampleMaxCrop, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::SliderFloat("Right", &d.crop_right, 0.0f, kDownsampleMaxCrop, "%.2f");
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::SliderFloat("Top", &d.crop_top, 0.0f, kDownsampleMaxCrop, "%.2f");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(120.0f);
+    changed |= ImGui::SliderFloat("Bottom", &d.crop_bottom, 0.0f, kDownsampleMaxCrop, "%.2f");
+    ImGui::BeginDisabled(frame_w <= 0 || frame_h <= 0);
+    if (ImGui::Button("Crop to 4:3 in the middle"))
+    {
+        d.crop_left = d.crop_right = crop_for_4_3(frame_w, frame_h);
+        d.crop_top = d.crop_bottom = 0.0f;
+        changed = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("No crop"))
+    {
+        d.crop_left = d.crop_right = d.crop_top = d.crop_bottom = 0.0f;
+        changed = true;
+    }
+    clamp_downsample(d);
+    return changed;
+}
+
+// Draws the overlay's "Game resolution" section: the four modes (see NativeMode), the
+// width and height for "Fixed" (kept within 16..7680 x 16..4320), the Downsample settings,
+// and in automatic mode the detector's state and a "Detect again" button that clears its
+// grid and searches again. Writes the settings to ReShade.ini when any of them changed.
+// The settings are global: they apply to every game window at once.
 void draw_resolution(RuntimeData &rd)
 {
     bool changed = false;
@@ -879,6 +981,10 @@ void draw_resolution(RuntimeData &rd)
     changed |= ImGui::RadioButton("Fixed", &g_settings.mode, native_manual);
     ImGui::SameLine();
     changed |= ImGui::RadioButton("Whole frame", &g_settings.mode, native_frame);
+    ImGui::SameLine();
+    changed |= ImGui::RadioButton("Downsample", &g_settings.mode, native_downsample);
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Averages the whole picture down to a small size, for 3D or smoothly upscaled games.");
     if (g_settings.mode == native_manual)
     {
         ImGui::SetNextItemWidth(120.0f);
@@ -889,6 +995,8 @@ void draw_resolution(RuntimeData &rd)
         g_settings.manual_w = std::clamp(g_settings.manual_w, 16, 7680);
         g_settings.manual_h = std::clamp(g_settings.manual_h, 16, 4320);
     }
+    if (g_settings.mode == native_downsample)
+        changed |= draw_downsample(rd.frame_w, rd.frame_h);
     if (g_settings.mode == native_auto)
     {
         ImGui::TextWrapped("%s", rd.detector.status().c_str());
