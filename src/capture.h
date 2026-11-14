@@ -6,6 +6,9 @@
 
 #include <string>
 
+class ShaderChain;
+struct PixelGrid;
+
 // Returns the path (UTF-8) of the capture preset, ready for librashader to load: the one
 // using capture_sm3.slang (for Direct3D 9, whose Shader Model 3 has no integer maths)
 // when `shader_model_3` is set, else the one using capture.slang. The files are built into
@@ -14,3 +17,8 @@
 // content, so different versions never mix) and later calls return the same path. Returns an empty
 // string and sets `error` if the files cannot be written.
 std::string capture_preset_path(bool shader_model_3, std::string &error);
+
+// Passes `grid` to `capture` (the capture preset compiled from that path): its rectangle,
+// native size and `average` flag become the shader's rra_* parameters. Returns false and
+// sets `error` if librashader rejects one.
+bool set_capture_params(ShaderChain &capture, const PixelGrid &grid, std::string &error);

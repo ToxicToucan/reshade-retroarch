@@ -93,12 +93,8 @@ bool render_d3d9(std::vector<uint8_t> &rgba, UINT w, UINT h, const PixelGrid &gr
     if (capture_path.empty() || !capture.create(chain_dev, capture_path, error) ||
         !chain.create(chain_dev, preset_path, error))
         return false;
-    const std::pair<const char *, int> grid_values[] = {
-        {"rra_rect_x", grid.rect_x}, {"rra_rect_y", grid.rect_y},     {"rra_rect_w", grid.rect_w},
-        {"rra_rect_h", grid.rect_h}, {"rra_native_w", grid.native_w}, {"rra_native_h", grid.native_h}};
-    for (const auto &[name, value] : grid_values)
-        if (!capture.set_param(name, float(value), error))
-            return false;
+    if (!set_capture_params(capture, grid, error))
+        return false;
     for (const auto &[name, value] : sets)
         if (!chain.set_param(name, value, error))
             return false;

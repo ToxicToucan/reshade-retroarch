@@ -14,6 +14,17 @@
 //     x = rect_x + floor((2i + 1) * rect_w / (2 * native_w)), and likewise for y.
 // This is the same integer formula the pixel grid detector uses (cell_centre in
 // grid_detect.h), so the capture reads exactly the pixels the detector validated.
+//
+// With rra_average set to 1 (the Downsample mode, downsample.h), output pixel (i, j) is
+// instead the average of every frame pixel that cell (i, j) covers, each weighted by the
+// part of its area inside the cell (a box filter). Cell (i, j) spans
+//     x from rect_x + i * rect_w / native_w to rect_x + (i + 1) * rect_w / native_w
+// (and likewise for y), which need not be whole pixels: a pixel the cell's edge cuts
+// through counts with the part inside. So a 3D picture drawn at full resolution is
+// reduced the way a supersampled render would be, and its edges come out smooth.
+// The values stored in the frame are averaged as they are (not converted to linear
+// light first), as RetroArch passes a core's picture to a preset.
+//
 // The values are set by the add-on through these parameters (they are not meant to
 // be changed by hand):
 
@@ -23,6 +34,7 @@
 #pragma parameter rra_rect_h "Game picture: height in the frame (pixels)" 1.0 1.0 16384.0 1.0
 #pragma parameter rra_native_w "Game picture: native width" 1.0 1.0 16384.0 1.0
 #pragma parameter rra_native_h "Game picture: native height" 1.0 1.0 16384.0 1.0
+#pragma parameter rra_average "Game picture: average each cell (1) or take its centre (0)" 0.0 0.0 1.0 1.0
 
 layout(push_constant) uniform Push
 {
@@ -33,6 +45,7 @@ layout(push_constant) uniform Push
     float rra_rect_h;
     float rra_native_w;
     float rra_native_h;
+    float rra_average;
 } params;
 
 layout(std140, set = 0, binding = 0) uniform UBO
@@ -63,7 +76,30 @@ void main()
     const uvec2 origin = uvec2(params.rra_rect_x, params.rra_rect_y);
     const uvec2 size = uvec2(params.rra_rect_w, params.rra_rect_h);
     const uvec2 native = uvec2(params.rra_native_w, params.rra_native_h);
-    // Exact integer maths: frame pixel at the centre of that cell.
-    const uvec2 p = origin + ((2u * cell + 1u) * size) / (2u * native);
-    FragColor = vec4(texelFetch(Source, ivec2(p), 0).rgb, 1.0);
+    if (params.rra_average < 0.5)
+    {
+        // Exact integer maths: frame pixel at the centre of that cell.
+        const uvec2 p = origin + ((2u * cell + 1u) * size) / (2u * native);
+        FragColor = vec4(texelFetch(Source, ivec2(p), 0).rgb, 1.0);
+        return;
+    }
+    // Area average. The cell's edges in frame pixels: [lo, hi) on each axis.
+    const vec2 lo = vec2(origin) + vec2(cell * size) / vec2(native);
+    const vec2 hi = vec2(origin) + vec2((cell + 1u) * size) / vec2(native);
+    const ivec2 first = ivec2(floor(lo));
+    const ivec2 last = ivec2(ceil(hi)) - 1;
+    vec3 sum = vec3(0.0);
+    for (int y = first.y; y <= last.y; ++y)
+    {
+        // Height of frame row y inside the cell.
+        const float wy = min(float(y + 1), hi.y) - max(float(y), lo.y);
+        vec3 row = vec3(0.0);
+        for (int x = first.x; x <= last.x; ++x)
+        {
+            const float wx = min(float(x + 1), hi.x) - max(float(x), lo.x);
+            row += wx * texelFetch(Source, ivec2(x, y), 0).rgb;
+        }
+        sum += wy * row;
+    }
+    FragColor = vec4(sum / ((hi.x - lo.x) * (hi.y - lo.y)), 1.0);
 }

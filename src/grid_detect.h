@@ -28,13 +28,21 @@ struct PixelGrid
     // the grid may be only the visible part of a larger picture, for example the strip of
     // gameplay left showing beside a menu drawn over the game.
     bool bounded = false; // true if it is the whole frame, or fits the content between uniform bars (plain borders)
+    // How the capture (capture.slang) makes each native pixel from its cell. False: the
+    // frame pixel at the cell's centre, which is exact for pixel art stretched with
+    // nearest-neighbour sampling. True: the average of every frame pixel the cell covers,
+    // weighted by how much of each pixel lies in the cell (an area average, or box filter);
+    // used by the Downsample mode (downsample.h) for pictures that have no pixel grid,
+    // such as 3D drawn at full resolution. Detection never sets it.
+    bool average = false;
 
-    // True when both grids have the same `valid`, native size and rectangle. `match` and
-    // `bounded` are not compared.
+    // True when both grids have the same `valid`, native size, rectangle and `average`.
+    // `match` and `bounded` are not compared.
     bool same_as(const PixelGrid &o) const
     {
         return valid == o.valid && native_w == o.native_w && native_h == o.native_h &&
-               rect_x == o.rect_x && rect_y == o.rect_y && rect_w == o.rect_w && rect_h == o.rect_h;
+               rect_x == o.rect_x && rect_y == o.rect_y && rect_w == o.rect_w && rect_h == o.rect_h &&
+               average == o.average;
     }
     // Returns a one-line summary for the user, for example
     // "424x240 in 3840x2160 at (0,0), match 100%", or "no pixel grid" when not valid.

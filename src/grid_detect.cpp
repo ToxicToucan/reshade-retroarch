@@ -13,14 +13,18 @@
 #include <vector>
 
 // Builds the one-line summary described in grid_detect.h. `match` is shown as a
-// percentage with one decimal.
+// percentage with one decimal; an averaged grid (Downsample mode) says "averaged" instead.
 std::string PixelGrid::describe() const
 {
     if (!valid)
         return "no pixel grid";
     std::ostringstream s;
     s << native_w << "x" << native_h << " in " << rect_w << "x" << rect_h << " at (" << rect_x << "," << rect_y
-      << "), match " << int(match * 1000.0f + 0.5f) / 10.0f << "%";
+      << ")";
+    if (average)
+        s << ", averaged";
+    else
+        s << ", match " << int(match * 1000.0f + 0.5f) / 10.0f << "%";
     return s.str();
 }
 

@@ -284,7 +284,8 @@ bool Renderer::render(ID3D11DeviceContext *ctx, const PixelGrid &grid, ShaderCha
 
     // Step 1: rebuild the native image: run the capture preset on the snapshot, into
     // native_tex_ (native_w x native_h). Its one pass writes each native pixel from the
-    // frame pixel at the centre of that pixel's block (capture.slang).
+    // frame pixel at the centre of that pixel's block, or from the average of the block
+    // when grid.average is set (capture.slang).
     if (!set_capture_grid(grid, error) ||
         !capture_.frame(reinterpret_cast<uint64_t>(ctx), ChainImage{0, reinterpret_cast<uint64_t>(snap_srv_)},
                         ChainImage{0, reinterpret_cast<uint64_t>(native_rtv_)}, 0, 0, grid.native_w, grid.native_h,
@@ -312,18 +313,14 @@ bool Renderer::render(ID3D11DeviceContext *ctx, const PixelGrid &grid, ShaderCha
     return true;
 }
 
-// Sets the capture preset's six parameters (capture.slang) from `grid`, skipping the
+// Sets the capture preset's parameters (capture.slang) from `grid`, skipping the
 // work when the grid has not changed since the last call.
 bool Renderer::set_capture_grid(const PixelGrid &grid, std::string &error)
 {
     if (grid.same_as(capture_grid_))
         return true;
-    const std::pair<const char *, int> values[] = {
-        {"rra_rect_x", grid.rect_x},       {"rra_rect_y", grid.rect_y},       {"rra_rect_w", grid.rect_w},
-        {"rra_rect_h", grid.rect_h},       {"rra_native_w", grid.native_w}, {"rra_native_h", grid.native_h}};
-    for (const auto &[name, value] : values)
-        if (!capture_.set_param(name, float(value), error))
-            return false;
+    if (!set_capture_params(capture_, grid, error))
+        return false;
     capture_grid_ = grid;
     return true;
 }

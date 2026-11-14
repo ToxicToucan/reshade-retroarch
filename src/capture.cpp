@@ -2,6 +2,8 @@
 
 #include "capture.h"
 #include "capture_slang.h"
+#include "chain.h"
+#include "grid_detect.h"
 #include "utf8.h"
 
 #include <filesystem>
@@ -77,4 +79,16 @@ std::string capture_preset_path(bool shader_model_3, std::string &error)
     }
     cached[shader_model_3] = utf8_from_path(dir / L"capture.slangp");
     return cached[shader_model_3];
+}
+
+bool set_capture_params(ShaderChain &capture, const PixelGrid &grid, std::string &error)
+{
+    const std::pair<const char *, int> values[] = {
+        {"rra_rect_x", grid.rect_x},     {"rra_rect_y", grid.rect_y},     {"rra_rect_w", grid.rect_w},
+        {"rra_rect_h", grid.rect_h},     {"rra_native_w", grid.native_w}, {"rra_native_h", grid.native_h},
+        {"rra_average", grid.average ? 1 : 0}};
+    for (const auto &[name, value] : values)
+        if (!capture.set_param(name, float(value), error))
+            return false;
+    return true;
 }

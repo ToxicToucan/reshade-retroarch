@@ -663,7 +663,8 @@ bool FrameRenderer::render(command_list *cmd, command_queue *queue, const PixelG
 
     // Step 1: rebuild the native picture: run the capture preset on the snapshot, into
     // native_ (native_w x native_h). Its one pass writes each native pixel from the frame
-    // pixel at the centre of that pixel's block (capture.slang).
+    // pixel at the centre of that pixel's block, or from the average of the block when
+    // grid.average is set (capture.slang).
     bool ok = capture_.frame(commands,
                              chain_image(snap_, snap_srv_, format_to_default_typed(snap_format_, 0), snap_w_, snap_h_),
                              chain_image(native_, native_rtv_, native_format(), nw, nh), 0, 0, int(nw), int(nh),
@@ -703,12 +704,8 @@ bool FrameRenderer::set_capture_grid(const PixelGrid &grid, std::string &error)
 {
     if (grid.same_as(capture_grid_))
         return true;
-    const std::pair<const char *, int> values[] = {
-        {"rra_rect_x", grid.rect_x}, {"rra_rect_y", grid.rect_y},     {"rra_rect_w", grid.rect_w},
-        {"rra_rect_h", grid.rect_h}, {"rra_native_w", grid.native_w}, {"rra_native_h", grid.native_h}};
-    for (const auto &[name, value] : values)
-        if (!capture_.set_param(name, float(value), error))
-            return false;
+    if (!set_capture_params(capture_, grid, error))
+        return false;
     capture_grid_ = grid;
     return true;
 }
