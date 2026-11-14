@@ -16,9 +16,14 @@
 //     --frames N          number of frames to render before saving (default 3); presets
 //                         that use earlier frames need a few to settle
 //     --native out.png    also save the recovered native image
-//     --grid auto|frame|WxH   how to find the native image: auto detects it (default),
-//                         frame uses the whole frame as it is, WxH treats the whole frame
-//                         as a W x H picture stretched to fill it
+//     --grid auto|frame|WxH|down:WxH|down-stretch:WxH   how to find the native image:
+//                         auto detects it (default), frame uses the whole frame as it is,
+//                         WxH treats the whole frame as a W x H picture stretched to fill
+//                         it; down:WxH averages the frame down as the add-on's Downsample
+//                         mode does with target W x H, keeping the frame's shape
+//                         (downsample.h), down-stretch:WxH to exactly W x H
+//     --crop L,T,R,B      with down: and down-stretch:, the Downsample crop at the left,
+//                         top, right and bottom edges, in percent (default 0,0,0,0)
 //     --set name=value    change a preset parameter before rendering (repeatable)
 //     --hashes 1          print a checksum of the back buffer after every frame, to see
 //                         whether frames of an unchanging input differ from each other
@@ -32,6 +37,7 @@
 // librashader.dll must be next to the executable.
 
 #include "chain.h"
+#include "downsample.h"
 #include "grid_detect.h"
 #include "librashader_api.h"
 #include "png_io.h"
@@ -121,7 +127,7 @@ int wmain(int argc, wchar_t **argv)
     if (argc < 4)
     {
         fwprintf(stderr, L"usage: render_png <preset.slangp> <input.png> <output.png> [--frames N] [--native out.png] "
-                         L"[--grid auto|frame|WxH] [--set name=value]...\n");
+                         L"[--grid auto|frame|WxH|down:WxH|down-stretch:WxH] [--crop L,T,R,B] [--set name=value]...\n");
         return 2;
     }
     // Options after the three fixed arguments, each followed by its value. Unknown
@@ -131,6 +137,7 @@ int wmain(int argc, wchar_t **argv)
     std::wstring api = L"d3d11", dxc_dir;
     const wchar_t *native_out = nullptr;
     std::wstring grid_mode = L"auto";
+    DownsampleSettings downsample;
     std::vector<std::pair<std::string, float>> sets;
     for (int a = 4; a < argc; ++a)
     {
@@ -149,6 +156,13 @@ int wmain(int argc, wchar_t **argv)
             dxc_dir = argv[++a];
         else if (opt == L"--grid")
             grid_mode = argv[++a];
+        else if (opt == L"--crop" &&
+                 swscanf_s(argv[++a], L"%f,%f,%f,%f", &downsample.crop_left, &downsample.crop_top,
+                           &downsample.crop_right, &downsample.crop_bottom) != 4)
+        {
+            fwprintf(stderr, L"bad --crop %s\n", argv[a]);
+            return 2;
+        }
         else if (opt == L"--set")
         {
             const std::string kv = narrow(argv[++a]);
@@ -195,6 +209,18 @@ int wmain(int argc, wchar_t **argv)
         printf("grid: %s  [%s]\n", grid.describe().c_str(), log.c_str());
         if (!grid.valid)
             return 1;
+    }
+    else if (grid_mode.rfind(L"down:", 0) == 0 || grid_mode.rfind(L"down-stretch:", 0) == 0)
+    {
+        downsample.stretch = grid_mode.rfind(L"down-stretch:", 0) == 0;
+        if (swscanf_s(grid_mode.c_str() + grid_mode.find(L':') + 1, L"%dx%d", &downsample.target_w,
+                      &downsample.target_h) != 2)
+        {
+            fwprintf(stderr, L"bad --grid %s\n", grid_mode.c_str());
+            return 2;
+        }
+        grid = downsample_grid(int(w), int(h), downsample);
+        printf("grid: %s\n", grid.describe().c_str());
     }
     else
     {
