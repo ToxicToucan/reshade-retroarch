@@ -172,6 +172,60 @@ int main()
         printf("skip  junction tests (mklink failed)\n");
     cancel = true;
     check(scan_presets(roots, cancel, skipped).empty(), "a cancelled scan stops");
+    cancel = false;
+
+    // RetroArch's shaders_cg and shaders_glsl folders are not searched (they hold no
+    // .slangp files, only thousands of others).
+    write(shaders / L"shaders_glsl" / L"stray.slangp", "shaders = 0\n");
+    write(shaders / L"shaders_cg" / L"stray.slangp", "shaders = 0\n");
+    {
+        const std::vector<PresetEntry> again = scan_presets(roots, cancel, skipped);
+        bool stray = false;
+        for (const PresetEntry &e : again)
+            stray |= e.rel.find("stray") != std::string::npos;
+        check(!stray, "shaders_cg and shaders_glsl are skipped");
+        check(!again.empty() && again[0].root == 0 && again[0].label == "retroarch-shaders/" + again[0].rel,
+              "an entry records its root and its path inside it");
+    }
+
+    // preset_display_name drops the folders and the .slangp extension, in any case.
+    check(preset_display_name("crt/crt-royale.slangp") == "crt-royale", "display name of a preset in a folder");
+    check(preset_display_name("look.SLANGP") == "look", "display name, extension in capitals");
+    check(preset_display_name("a.b/c.d") == "c.d", "display name of a file without .slangp");
+
+    // build_preset_tree puts each preset under its root and folders, files and folders
+    // sorted by name ignoring case; a root without presets gets an empty tree.
+    {
+        const std::vector<ShaderRoot> tree_roots = {{"one", root / L"one"}, {"two", root / L"two"}};
+        const std::vector<PresetEntry> list = {
+            {"one/b.slangp", root / L"one" / L"b.slangp", 0, "b.slangp"},
+            {"one/crt/Z.slangp", root / L"one" / L"crt" / L"Z.slangp", 0, "crt/Z.slangp"},
+            {"one/crt/a.slangp", root / L"one" / L"crt" / L"a.slangp", 0, "crt/a.slangp"},
+            {"one/A/x.slangp", root / L"one" / L"A" / L"x.slangp", 0, "A/x.slangp"},
+        };
+        const std::vector<PresetFolder> t = build_preset_tree(tree_roots, list);
+        check(t.size() == 2 && t[0].name == "one" && t[1].name == "two", "one tree per root, named after it");
+        check(t.size() == 2 && t[1].files.empty() && t[1].folders.empty(), "a root without presets is empty");
+        check(t[0].files.size() == 1 && t[0].files[0] == 0, "a preset at the top of a root");
+        check(t[0].folders.size() == 2 && t[0].folders[0].name == "A" && t[0].folders[1].name == "crt",
+              "folders sorted ignoring case");
+        check(t[0].folders.size() == 2 && t[0].folders[1].files.size() == 2 && t[0].folders[1].files[0] == 2 &&
+                  t[0].folders[1].files[1] == 1,
+              "files sorted ignoring case (a before Z)");
+    }
+
+    // find_shader_roots: ShaderPaths folders come first and are marked as the user's;
+    // automatic RetroArch folders are left out when auto_find is off; a folder is listed once.
+    {
+        const fs::path mine = root / L"RetroArch" / L"shaders";
+        fs::create_directories(mine);
+        const std::vector<ShaderRoot> found_roots = find_shader_roots(root / L"game", root / L"game", {mine, mine}, false);
+        check(!found_roots.empty() && found_roots[0].user && found_roots[0].name == "RetroArch/shaders",
+              "a ShaderPaths folder comes first, named with its parent");
+        check(found_roots.size() == 2 && !found_roots[1].user && found_roots[1].name == "retroarch-shaders",
+              "the same folder twice is listed once; retroarch-shaders follows (" +
+                  std::to_string(found_roots.size()) + " roots)");
+    }
 
     // Clean up. The junctions are removed first, so that deleting the folder tree does
     // not follow them into the folders they point to.

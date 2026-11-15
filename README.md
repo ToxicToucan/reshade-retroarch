@@ -18,8 +18,10 @@ as HD side art, are left alone.
    [Releases](https://github.com/Jorl17/reshade-retroarch/releases) and extract it into
    the game's folder, next to its `.exe`.
 3. Put shaders in `retroarch-shaders\`, for example the
-   [libretro slang-shaders](https://github.com/libretro/slang-shaders). An installed
-   RetroArch (default folder, `%APPDATA%\RetroArch` or Steam) is found automatically.
+   [libretro slang-shaders](https://github.com/libretro/slang-shaders), or add your
+   RetroArch `shaders` folder in the window (**Shader → Shader folders → Add folder**). An
+   installed RetroArch (default folder, `%APPDATA%\RetroArch`, EmuDeck or Steam) is found
+   automatically.
 4. **Direct3D 12 games only:** also add Microsoft's DirectX Shader Compiler, which is not
    included. Download `dxc_<date>.zip` from
    [Microsoft's DirectXShaderCompiler releases](https://github.com/microsoft/DirectXShaderCompiler/releases)
@@ -38,7 +40,9 @@ and [Visual C++ Redistributable (x64)](https://learn.microsoft.com/en-us/cpp/win
 Press **Home** and open the **RetroArch Shaders** window (a tab next to Home, or a
 separate window if you have used ReShade in this game before).
 
-- **Shader:** filter, select a preset, press **Use for this ReShade preset**.
+- **Shader:** open a folder in the list (or type in the filter box), select a preset, and
+  press **Use for this ReShade preset**, or double-click it. Drag the list's bottom edge
+  to make it taller; hovering a preset shows its full path.
 - **Shader parameters:** sliders apply live. **Save to this ReShade preset** keeps them,
   **Revert** goes back.
 - **Game resolution:** leave on **Detect automatically** unless the detected resolution
@@ -58,11 +62,14 @@ diffusion_weight = "0.010000"
 
 You can write these by hand or drop one in while the game runs.
 
-To search more folders, add them to `ReShade.ini`:
+To search more folders, add them under **Shader folders** in the window, or in `ReShade.ini`.
+Folders you add are listed first. Untick **Also search RetroArch installs found
+automatically** to see only your own folders.
 
 ```ini
 [RetroArchShaders]
-ShaderPaths=D:\my-shaders;E:\more-shaders
+ShaderPaths=D:\my-shaders,E:\more-shaders
+AutoFindShaders=1
 ```
 
 ## Resolution modes

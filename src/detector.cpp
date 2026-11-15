@@ -105,6 +105,8 @@ bool GridDetector::ensure_readback(device *dev, const resource_desc &desc)
 void GridDetector::tick(device *dev, command_queue *queue, resource frame, double now)
 {
     const resource_desc desc = dev->get_resource_desc(frame);
+    last_now_ = now;
+    const Stage stage_before = stage_;
 
     // Frame size changed: rescale the grid's rectangle to the new size as a provisional
     // estimate (the native resolution stays), so the picture stays sensible, and detect
@@ -135,8 +137,15 @@ void GridDetector::tick(device *dev, command_queue *queue, resource frame, doubl
         // Start a copy when the interval has passed and the readback texture is ready. The
         // commands only get queued; the GPU does the copy later.
         const double interval = (grid_.valid && !provisional_) ? kIntervalKnown : kIntervalSearching;
-        if (now - last_request_ < interval || !ensure_readback(dev, desc))
+        if (now - last_request_ < interval)
             break;
+        if (!ensure_readback(dev, desc))
+        {
+            ++readback_failures_;
+            last_request_ = now; // try again after the interval, not every frame
+            break;
+        }
+        ++copies_;
         command_list *const cmd = queue->get_immediate_command_list();
         cmd->barrier(frame, resource_usage::shader_resource, resource_usage::copy_source);
         cmd->copy_texture_region(frame, 0, nullptr, readback_, 0, nullptr);
@@ -169,6 +178,7 @@ void GridDetector::tick(device *dev, command_queue *queue, resource frame, doubl
         if (!dev->map_texture_region(readback_, 0, nullptr, map_access::read_only, &data))
         {
             // Mapping failed: drop this copy; a new one starts after the interval.
+            ++map_failures_;
             stage_ = Stage::idle;
             break;
         }
@@ -212,6 +222,8 @@ void GridDetector::tick(device *dev, command_queue *queue, resource frame, doubl
         break;
     }
     }
+    if (stage_ != stage_before)
+        stage_since_ = now;
 }
 
 // Applies one detection result: records `log` for status() and replaces the grid in use
@@ -331,7 +343,26 @@ void GridDetector::release(device *dev, bool mapped)
 // detection finishes, or "no pixel grid found yet" with the last detection's diagnosis.
 std::string GridDetector::status() const
 {
+    if (!grid_.valid && detections_ > 0)
+        return "no pixel grid found yet (" + last_log_ + ")";
     if (!grid_.valid)
-        return detections_ == 0 ? "looking for the game's pixels" : "no pixel grid found yet (" + last_log_ + ")";
+    {
+        // No detection has finished yet. Normally that takes well under a second; if it does
+        // not, say where it is stuck, so a report can name the cause.
+        const int waited = int(last_now_ - stage_since_);
+        std::string why;
+        if (copies_ == 0 && readback_failures_ > 0)
+            why = "the frame cannot be copied for reading (" + std::to_string(readback_failures_) + " tries)";
+        else if (copies_ == 0)
+            why = "no frame copied yet";
+        else if (stage_ == Stage::copied && waited >= 2)
+            why = "waiting " + std::to_string(waited) + " s for the GPU to copy the frame";
+        else if (stage_ == Stage::analysing && waited >= 2)
+            why = "analysing a " + std::to_string(readback_w_) + "x" + std::to_string(readback_h_) + " frame for " +
+                  std::to_string(waited) + " s";
+        else if (map_failures_ > 0)
+            why = "the copied frame could not be read " + std::to_string(map_failures_) + " times";
+        return why.empty() ? "looking for the game's pixels" : "looking for the game's pixels: " + why;
+    }
     return grid_.describe() + (provisional_ ? " (re-checking after resize)" : "");
 }

@@ -148,4 +148,9 @@ private:
     std::string last_log_;
     // Number of detections finished, successful or not.
     int detections_ = 0;
+    // For status() while no detection has finished yet, to say where it is stuck: copies
+    // started, failures to create the readback texture and to map it, when the current stage
+    // began, and the time passed to the latest tick().
+    int copies_ = 0, readback_failures_ = 0, map_failures_ = 0;
+    double stage_since_ = 0, last_now_ = 0;
 };

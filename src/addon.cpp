@@ -60,6 +60,7 @@ struct Settings
     DownsampleSettings downsample;      // size, shape and crop used in "Downsample" mode
     HdrSettings hdr;                    // paper white, peak and gamut for games that output HDR
     std::vector<fs::path> extra_paths;  // extra folders to search for presets (ShaderPaths=)
+    bool auto_find = true;              // also search RetroArch installs found automatically (AutoFindShaders=)
 };
 
 // Everything the add-on keeps for one ReShade effect runtime. An effect runtime is ReShade's
@@ -154,6 +155,7 @@ std::unordered_map<uint64_t, swapchain *> g_swapchains;
 Scan *g_scan = nullptr;
 std::vector<ShaderRoot> g_roots;
 std::vector<PresetEntry> g_presets;
+std::vector<PresetFolder> g_tree; // g_presets as a folder tree, one per root (build_preset_tree)
 int g_scan_skipped = 0;
 std::string g_scan_error;
 bool g_scan_started = false;
@@ -162,6 +164,7 @@ bool g_scan_started = false;
 // selected in the list (-1 for none).
 char g_filter[128] = "";
 int g_selected = -1;
+char g_new_folder[1024] = ""; // the "Add folder" text box
 
 // Returns the current time in seconds from a clock that never jumps. Only differences
 // between two values mean anything.
@@ -230,6 +233,7 @@ void load_settings()
     reshade::get_config_value(nullptr, kSection, "HdrPeak", g_settings.hdr.peak);
     reshade::get_config_value(nullptr, kSection, "HdrExpandGamut", g_settings.hdr.expand_gamut);
     clamp_hdr(g_settings.hdr);
+    reshade::get_config_value(nullptr, kSection, "AutoFindShaders", g_settings.auto_find);
 
     // ShaderPaths: extra folders to search for presets. The first call gets the value's
     // size. ReShade splits values on ',' and returns the parts separated by '\0', so '\0',
@@ -257,8 +261,27 @@ void load_settings()
     }
 }
 
+// Writes the shader folder settings (ShaderPaths and AutoFindShaders) from g_settings to the
+// global ReShade.ini. ShaderPaths is written as a list (ReShade separates the parts with ','
+// in the file); folder names containing ',' cannot be stored.
+void save_shader_folders()
+{
+    std::string list;
+    for (const fs::path &p : g_settings.extra_paths)
+    {
+        if (!list.empty())
+            list += '\0';
+        list += utf8_from_path(p);
+    }
+    if (list.empty())
+        reshade::set_config_value(nullptr, kSection, "ShaderPaths", "");
+    else
+        reshade::set_config_value(nullptr, kSection, "ShaderPaths", list.c_str(), list.size() + 1);
+    reshade::set_config_value(nullptr, kSection, "AutoFindShaders", g_settings.auto_find);
+}
+
 // Writes the resolution mode, the "Fixed" width and height and the "Downsample" settings from
-// g_settings to the global ReShade.ini. ShaderPaths is never written: only the user edits it.
+// g_settings to the global ReShade.ini. The shader folders are written by save_shader_folders().
 void save_settings()
 {
     reshade::set_config_value(nullptr, kSection, "NativeMode", g_settings.mode);
@@ -289,10 +312,11 @@ void start_scan()
     // The thread gets its own copies of the folders, so it never reads globals.
     const fs::path addon_dir = g_addon_dir, exe_dir = g_exe_dir;
     const std::vector<fs::path> extra = g_settings.extra_paths;
-    scan->thread = std::thread([scan, addon_dir, exe_dir, extra] {
+    const bool auto_find = g_settings.auto_find;
+    scan->thread = std::thread([scan, addon_dir, exe_dir, extra, auto_find] {
         try
         {
-            scan->roots = find_shader_roots(addon_dir, exe_dir, extra);
+            scan->roots = find_shader_roots(addon_dir, exe_dir, extra, auto_find);
             scan->presets = scan_presets(scan->roots, scan->cancel, scan->skipped);
         }
         catch (const std::exception &e)
@@ -315,8 +339,12 @@ bool poll_scan()
     if (!g_scan->done.load(std::memory_order_acquire))
         return true;
     g_scan->thread.join();
+    // Keep the selection on the same file if it is still there.
+    const fs::path selected = (g_selected >= 0 && g_selected < int(g_presets.size())) ? g_presets[size_t(g_selected)].path
+                                                                                         : fs::path();
     g_roots = std::move(g_scan->roots);
     g_presets = std::move(g_scan->presets);
+    g_tree = build_preset_tree(g_roots, g_presets);
     g_scan_skipped = g_scan->skipped;
     g_scan_error = g_scan->error;
     if (!g_scan_error.empty())
@@ -324,6 +352,9 @@ bool poll_scan()
     delete g_scan;
     g_scan = nullptr;
     g_selected = -1;
+    for (size_t i = 0; !selected.empty() && i < g_presets.size(); ++i)
+        if (g_presets[i].path == selected)
+            g_selected = int(i);
     return false;
 }
 
@@ -862,30 +893,171 @@ std::string companion_description(const RuntimeData &rd)
     return utf8_from_path(rd.companion.filename());
 }
 
-// Draws the overlay's "Shader" section: the presets found on disk, a box to filter them by
-// name, and buttons to attach the selected preset to the current ReShade preset, detach the
-// attached one, or search the folders again. The first call starts the search.
+// Set when the shader folder settings change while a search is running: the next frame
+// without a running search starts a new one with the new settings.
+bool g_rescan_pending = false;
+
+// Searches again with the current folder settings, now or when the running search ends.
+void rescan()
+{
+    if (g_scan != nullptr)
+        g_rescan_pending = true;
+    else
+        start_scan();
+}
+
+// "Use": writes the companion .slangp as a reference to preset `index` of g_presets, with no
+// parameter changes, so it compiles on the next frame. On failure, sets rd.action_error.
+void use_preset(RuntimeData &rd, size_t index)
+{
+    if (index >= g_presets.size() || rd.companion.empty())
+        return;
+    std::string err;
+    const fs::path &target = g_presets[index].path;
+    if (write_companion(rd.companion, target, reference_relative(target), {}, err))
+    {
+        rd.action_error.clear();
+        refresh_companion(rd);
+        rd.force_reload = true;
+    }
+    else
+        set_action_error(rd, err);
+}
+
+// One preset in the list: its name, selected on click, used on double-click; hovering shows
+// the full path. `folder` (may be empty) is shown dimmed after the name, for filter results.
+void draw_preset_row(RuntimeData &rd, size_t index, const std::string &folder)
+{
+    const PresetEntry &e = g_presets[index];
+    ImGui::PushID(int(index));
+    if (ImGui::Selectable(preset_display_name(e.rel).c_str(), g_selected == int(index),
+                          ImGuiSelectableFlags_AllowDoubleClick))
+    {
+        g_selected = int(index);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            use_preset(rd, index);
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s\nDouble-click to use it.", utf8_from_path(e.path).c_str());
+    if (!folder.empty())
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", folder.c_str());
+    }
+    ImGui::PopID();
+}
+
+// The contents of one folder of the tree: its presets, then its subfolders, each a node that
+// opens on click.
+void draw_tree_folder(RuntimeData &rd, const PresetFolder &f)
+{
+    for (size_t i : f.files)
+        draw_preset_row(rd, i, {});
+    for (const PresetFolder &sub : f.folders)
+    {
+        if (ImGui::TreeNodeEx(sub.name.c_str(), ImGuiTreeNodeFlags_SpanAvailWidth))
+        {
+            draw_tree_folder(rd, sub);
+            ImGui::TreePop();
+        }
+    }
+}
+
+// The "Shader folders" part of the Shader section: every folder searched, with a button to
+// remove the ones the user added, a box to add one, and whether to also search RetroArch
+// installs found automatically. Changes are saved to ReShade.ini and searched at once.
+void draw_shader_folders()
+{
+    static std::string folder_error; // why the last "Add folder" failed, until the next attempt
+    if (!ImGui::TreeNodeEx("Shader folders", ImGuiTreeNodeFlags_SpanAvailWidth))
+        return;
+    for (size_t i = 0; i < g_roots.size(); ++i)
+    {
+        const ShaderRoot &r = g_roots[i];
+        ImGui::PushID(int(i));
+        if (r.user)
+        {
+            if (ImGui::SmallButton("Remove"))
+            {
+                std::error_code ec;
+                auto &paths = g_settings.extra_paths;
+                paths.erase(std::remove_if(paths.begin(), paths.end(),
+                                           [&](const fs::path &p) { return p == r.dir || fs::equivalent(p, r.dir, ec); }),
+                            paths.end());
+                save_shader_folders();
+                rescan();
+            }
+            ImGui::SameLine();
+        }
+        ImGui::TextUnformatted(r.name.c_str());
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", utf8_from_path(r.dir).c_str());
+        ImGui::PopID();
+    }
+    ImGui::SetNextItemWidth(-ImGui::CalcTextSize("Add folder").x - ImGui::GetStyle().FramePadding.x * 4.0f);
+    const bool enter = ImGui::InputTextWithHint("##newfolder", "Paste a folder, e.g. C:\\RetroArch\\shaders", g_new_folder,
+                                                sizeof(g_new_folder), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Add folder") || enter)
+    {
+        std::string text = trim(g_new_folder);
+        if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+            text = text.substr(1, text.size() - 2); // "Copy as path" in Explorer adds quotes
+        const fs::path dir = path_from_utf8(text);
+        std::error_code ec;
+        if (text.empty())
+            folder_error.clear();
+        else if (!fs::is_directory(dir, ec))
+            folder_error = "Not a folder: " + text;
+        else if (text.find(',') != std::string::npos)
+            folder_error = "Folder names with a comma cannot be saved in ReShade.ini.";
+        else
+        {
+            folder_error.clear();
+            g_settings.extra_paths.push_back(dir);
+            save_shader_folders();
+            g_new_folder[0] = '\0';
+            rescan();
+        }
+    }
+    if (!folder_error.empty())
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "%s", folder_error.c_str());
+    if (ImGui::Checkbox("Also search RetroArch installs found automatically", &g_settings.auto_find))
+    {
+        save_shader_folders();
+        rescan();
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("RetroArch's default folders, %%APPDATA%%, EmuDeck and Steam libraries.\nFolders you add are "
+                          "always searched, and listed first.");
+    ImGui::TreePop();
+}
+
+// Draws the overlay's "Shader" section: the presets found on disk as a folder tree (or, while
+// filtering, the matching presets with their folders), the selected preset's full path,
+// buttons to attach it to the current ReShade preset, detach the attached one or search
+// again, and the folders searched. The first call starts the search.
 void draw_shader_picker(RuntimeData &rd)
 {
     if (!g_scan_started)
         start_scan();
-    const bool scanning = poll_scan();
+    bool scanning = poll_scan();
+    if (!scanning && g_rescan_pending)
+    {
+        g_rescan_pending = false;
+        start_scan();
+        scanning = true;
+    }
 
-    // Summary line: still searching; nothing found, with where to put shaders and which
-    // folders were searched; or how many presets were found. Then any search problems.
+    // Summary line: still searching; nothing found, with where to put shaders; or how many
+    // presets were found. Then any search problems.
     if (scanning)
         ImGui::TextDisabled("Looking for shader presets...");
     else if (g_presets.empty())
     {
-        ImGui::TextWrapped("No RetroArch shaders found. Put shader presets (for example the libretro "
-                           "\"slang-shaders\" collection) in:");
+        ImGui::TextWrapped("No RetroArch shaders found. Add your RetroArch \"shaders\" folder under Shader folders "
+                           "below, or put shader presets in:");
         ImGui::TextUnformatted(utf8_from_path(g_addon_dir / L"retroarch-shaders").c_str());
-        if (!g_roots.empty())
-        {
-            ImGui::TextDisabled("Searched:");
-            for (const ShaderRoot &r : g_roots)
-                ImGui::TextDisabled("  %s", utf8_from_path(r.dir).c_str());
-        }
     }
     else
         ImGui::Text("%d presets in %d folder(s).", int(g_presets.size()), int(g_roots.size()));
@@ -895,49 +1067,76 @@ void draw_shader_picker(RuntimeData &rd)
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Scan failed: %s", g_scan_error.c_str());
 
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##filter", "Filter, e.g. crt-royale", g_filter, sizeof(g_filter));
+    ImGui::InputTextWithHint("##filter", "Filter by name, e.g. crt-guest", g_filter, sizeof(g_filter));
 
-    // The list shows the presets whose label contains the filter text, ignoring case.
-    // Clicking one selects it. PushID gives each row its own ImGui ID even if labels repeat.
-    if (ImGui::BeginListBox("##presets", ImVec2(-1.0f, 260.0f)))
+    // The list: a box the user can make taller by dragging its bottom edge, scrolling
+    // sideways for long names.
+    const float height = ImGui::GetTextLineHeightWithSpacing() * 16.0f;
+    if (ImGui::BeginChild("##presets", ImVec2(0.0f, height), ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY,
+                          ImGuiWindowFlags_HorizontalScrollbar))
     {
         std::string filter = g_filter;
         for (char &c : filter)
             c = char(tolower(static_cast<unsigned char>(c)));
-        for (int i = 0; i < int(g_presets.size()); ++i)
+        if (filter.empty())
         {
-            const std::string &label = g_presets[size_t(i)].label;
-            std::string lower = label;
-            for (char &c : lower)
-                c = char(tolower(static_cast<unsigned char>(c)));
-            if (!filter.empty() && lower.find(filter) == std::string::npos)
-                continue;
-            ImGui::PushID(i);
-            if (ImGui::Selectable(label.c_str(), g_selected == i))
-                g_selected = i;
-            ImGui::PopID();
-        }
-        ImGui::EndListBox();
-    }
-
-    // "Use": write the companion .slangp as a reference to the selected preset, with no
-    // parameter changes, and compile it on the next frame. Needs a selection and a
-    // selected ReShade preset.
-    const bool has_selection = g_selected >= 0 && g_selected < int(g_presets.size());
-    ImGui::BeginDisabled(!has_selection || rd.companion.empty());
-    if (ImGui::Button("Use for this ReShade preset"))
-    {
-        std::string err;
-        const fs::path &target = g_presets[size_t(g_selected)].path;
-        if (write_companion(rd.companion, target, reference_relative(target), {}, err))
-        {
-            rd.action_error.clear();
-            refresh_companion(rd);
-            rd.force_reload = true;
+            // One node per folder searched. Folders the user added, and the only folder if
+            // there is just one, start open.
+            for (size_t r = 0; r < g_tree.size() && r < g_roots.size(); ++r)
+            {
+                const PresetFolder &tree = g_tree[r];
+                ImGui::PushID(int(r));
+                const ImGuiTreeNodeFlags flags =
+                    ImGuiTreeNodeFlags_SpanAvailWidth |
+                    ((g_roots[r].user || g_roots.size() == 1) ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+                const bool open = ImGui::TreeNodeEx("##root", flags, "%s", tree.name.c_str());
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("%s", utf8_from_path(g_roots[r].dir).c_str());
+                if (open)
+                {
+                    if (tree.files.empty() && tree.folders.empty())
+                        ImGui::TextDisabled("(no presets)");
+                    draw_tree_folder(rd, tree);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
         }
         else
-            set_action_error(rd, err);
+        {
+            // Filtering: every preset whose name or folder contains the text, ignoring case,
+            // with its folder after the name.
+            for (size_t i = 0; i < g_presets.size(); ++i)
+            {
+                std::string lower = g_presets[i].label;
+                for (char &c : lower)
+                    c = char(tolower(static_cast<unsigned char>(c)));
+                if (lower.find(filter) == std::string::npos)
+                    continue;
+                const std::string &label = g_presets[i].label;
+                const size_t slash = label.find_last_of('/');
+                draw_preset_row(rd, i, slash == std::string::npos ? std::string() : label.substr(0, slash));
+            }
+        }
     }
+    ImGui::EndChild();
+
+    // The selected preset, in full.
+    const bool has_selection = g_selected >= 0 && g_selected < int(g_presets.size());
+    if (has_selection)
+    {
+        const PresetEntry &e = g_presets[size_t(g_selected)];
+        ImGui::TextWrapped("Selected: %s", preset_display_name(e.rel).c_str());
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextWrapped("%s", utf8_from_path(e.path).c_str());
+        ImGui::PopStyleColor();
+    }
+    else
+        ImGui::TextDisabled("Select a preset (double-click uses it).");
+
+    ImGui::BeginDisabled(!has_selection || rd.companion.empty());
+    if (ImGui::Button("Use for this ReShade preset"))
+        use_preset(rd, size_t(g_selected));
     ImGui::EndDisabled();
     ImGui::SameLine();
     // "Remove": detach the RetroArch shader from this ReShade preset. The companion file is
@@ -960,6 +1159,8 @@ void draw_shader_picker(RuntimeData &rd)
     if (ImGui::Button("Rescan"))
         start_scan();
     ImGui::EndDisabled();
+
+    draw_shader_folders();
 }
 
 // Draws the "Downsample" settings (see DownsampleSettings in downsample.h): one-click
@@ -1023,10 +1224,6 @@ bool draw_downsample(int frame_w, int frame_h)
         changed = true;
     }
     clamp_downsample(d);
-    reshade::get_config_value(nullptr, kSection, "HdrPaperWhite", g_settings.hdr.paper_white);
-    reshade::get_config_value(nullptr, kSection, "HdrPeak", g_settings.hdr.peak);
-    reshade::get_config_value(nullptr, kSection, "HdrExpandGamut", g_settings.hdr.expand_gamut);
-    clamp_hdr(g_settings.hdr);
     return changed;
 }
 
